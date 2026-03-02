@@ -43,6 +43,7 @@ jaraco.context==6.1.0
 jaraco.functools==4.4.0
 json_repair==0.44.1
 jsonpatch==1.33
+jsonpath-ng==1.8.0
 jsonpointer==3.0.0
 jsonref==1.1.0
 jsonschema==4.26.0
@@ -58,6 +59,7 @@ langchain-ollama==1.0.1
 langchain-text-splitters==1.1.1
 langgraph==1.0.10
 langgraph-checkpoint==4.0.1
+langgraph-checkpoint-redis==0.3.6
 langgraph-checkpoint-sqlite==3.0.3
 langgraph-prebuilt==1.0.8
 langgraph-sdk==0.3.9
@@ -67,6 +69,7 @@ markdown-it-py==4.0.0
 marshmallow==3.26.2
 mcp==1.26.0
 mdurl==0.1.2
+ml_dtypes==0.5.4
 more-itertools==10.8.0
 multidict==6.7.1
 mypy_extensions==1.1.0
@@ -96,10 +99,13 @@ pyperclip==1.11.0
 python-dotenv==1.2.2
 python-json-logger==4.0.0
 python-multipart==0.0.22
+python-ulid==3.1.0
 pytz==2025.2
 pywin32==311
 pywin32-ctypes==0.2.3
 PyYAML==6.0.3
+redis==7.1.1
+redisvl==0.15.0
 referencing==0.37.0
 requests==2.32.5
 requests-toolbelt==1.0.0
