@@ -154,24 +154,88 @@ class LabelResolver:
 
 # ── Layer 2: Entity Name Resolution ──────────────────────────────────────────
 
+# Default full-text index name used for entity name lookups.
+FULLTEXT_INDEX_NAME = "entityNameIndex"
+
+
+def ensure_fulltext_index(graph: Any, schema: str) -> bool:
+    """
+    Ensure a full-text index exists for entity name resolution.
+
+    Attempts to create the index if it doesn't exist.  Returns True if
+    the index is available, False otherwise (e.g. insufficient permissions).
+
+    The index covers all node labels found in the schema across common
+    name properties: ``name``, ``title``.
+    """
+    try:
+        # Check if index already exists
+        existing = graph.query(
+            "SHOW FULLTEXT INDEXES WHERE name = $name",
+            params={"name": FULLTEXT_INDEX_NAME},
+        )
+        if existing:
+            return True
+    except Exception:
+        # SHOW INDEXES may not be available on all Neo4j versions
+        pass
+
+    # Extract labels from the schema to build the index
+    labels: list[str] = []
+    for match in re.finditer(r"^\s*(\w+)\s*\{", schema, re.MULTILINE):
+        label = match.group(1)
+        if label not in ("Node", "Relationship", "The"):
+            labels.append(label)
+
+    if not labels:
+        logger.warning("No labels found in schema; cannot create full-text index.")
+        return False
+
+    # Build the CREATE INDEX statement
+    label_list = "|".join(labels)
+    create_stmt = (
+        f"CREATE FULLTEXT INDEX {FULLTEXT_INDEX_NAME} IF NOT EXISTS "
+        f"FOR (n:{label_list}) ON EACH [n.name, n.title]"
+    )
+
+    try:
+        graph.query(create_stmt)
+        logger.info(
+            "Created full-text index '%s' on labels [%s] for properties [name, title].",
+            FULLTEXT_INDEX_NAME, label_list,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Could not create full-text index '%s': %s. "
+            "Layer 2 will use fallback CONTAINS query.",
+            FULLTEXT_INDEX_NAME, exc,
+        )
+        return False
+
 
 class EntityNameResolver:
     """
     Resolve typos in entity names by querying Neo4j for close matches.
 
-    Uses a lightweight Cypher query with ``toLower()`` and an in-memory
-    LRU cache to avoid repeated DB hits.
+    Uses a **full-text index** (Lucene-backed) for sub-millisecond lookups
+    that scale to millions of nodes.  Falls back to a ``CONTAINS`` query
+    if the full-text index is unavailable.
+
+    Results are cached in an LRU cache to avoid repeated DB hits.
     """
 
     def __init__(
         self,
         graph: Any,
+        schema: str = "",
         fuzzy_threshold: float = 0.75,
         max_candidates: int = 5,
     ) -> None:
         self._graph = graph
         self._fuzzy_threshold = fuzzy_threshold
         self._max_candidates = max_candidates
+        self._has_fulltext_index = ensure_fulltext_index(graph, schema) if schema else False
 
     async def resolve(
         self, question: str, known_labels: list[str],
@@ -224,15 +288,40 @@ class EntityNameResolver:
         return candidates
 
     @lru_cache(maxsize=256)
-    def _cached_query(self, candidate_lower: str) -> list[dict]:
-        """Synchronous Neo4j query (cached to avoid repeated lookups)."""
+    def _fulltext_query(self, candidate: str) -> list[dict]:
+        """
+        Query using Neo4j full-text index with Lucene fuzzy matching.
+
+        The ``~`` suffix enables Lucene edit-distance matching,
+        which handles typos efficiently at any database scale.
+        """
+        # Escape Lucene special chars and append fuzzy operator
+        escaped = re.sub(r'([+\-&|!(){}[\]^"~*?:\\/ ])', r"\\\1", candidate)
+        search_term = f"{escaped}~"
+        cypher = (
+            f"CALL db.index.fulltext.queryNodes('{FULLTEXT_INDEX_NAME}', $term) "
+            "YIELD node, score "
+            "RETURN labels(node)[0] AS label, "
+            "COALESCE(node.name, node.title) AS name, score "
+            "LIMIT $limit"
+        )
+        try:
+            return self._graph.query(
+                cypher,
+                params={"term": search_term, "limit": self._max_candidates},
+            )
+        except Exception as exc:
+            logger.warning("Full-text entity lookup failed: %s", exc)
+            return []
+
+    @lru_cache(maxsize=256)
+    def _fallback_query(self, candidate_lower: str) -> list[dict]:
+        """Fallback CONTAINS query when full-text index is unavailable."""
         cypher = (
             "MATCH (n) "
-            "WHERE any(prop IN keys(n) WHERE toLower(toString(n[prop])) "
-            "CONTAINS $candidate) "
+            "WHERE toLower(COALESCE(n.name, n.title, '')) CONTAINS $candidate "
             "RETURN labels(n)[0] AS label, "
-            "head([prop IN keys(n) WHERE toLower(toString(n[prop])) "
-            "CONTAINS $candidate | n[prop]]) AS name "
+            "COALESCE(n.name, n.title) AS name "
             "LIMIT $limit"
         )
         try:
@@ -244,15 +333,21 @@ class EntityNameResolver:
                 },
             )
         except Exception as exc:
-            logger.warning("Entity name lookup failed: %s", exc)
+            logger.warning("Fallback entity name lookup failed: %s", exc)
             return []
 
     async def _find_closest_match(self, candidate: str) -> str | None:
         """Find the closest matching entity name in Neo4j."""
         loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, self._cached_query, candidate.lower(),
-        )
+
+        if self._has_fulltext_index:
+            results = await loop.run_in_executor(
+                None, self._fulltext_query, candidate,
+            )
+        else:
+            results = await loop.run_in_executor(
+                None, self._fallback_query, candidate.lower(),
+            )
 
         if not results:
             return None
@@ -262,6 +357,8 @@ class EntityNameResolver:
 
         for row in results:
             name = str(row.get("name", ""))
+            if not name:
+                continue
             score = difflib.SequenceMatcher(
                 None, candidate.lower(), name.lower(),
             ).ratio()
@@ -392,6 +489,7 @@ async def resolve_entities(
     try:
         name_resolver = EntityNameResolver(
             graph=graph,
+            schema=schema,
             fuzzy_threshold=fuzzy_threshold,
             max_candidates=max_candidates,
         )
