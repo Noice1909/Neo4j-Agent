@@ -18,9 +18,11 @@ import logging
 
 from langchain_core.language_models import BaseChatModel
 
+from app.core.config import get_settings
 from app.core.exceptions import ReadOnlyViolationError
 from app.graph.connection import get_graph
 from app.graph.cypher.coreference import resolve_coreferences
+from app.graph.cypher.entity_resolver import resolve_entities
 from app.graph.cypher.retry import execute_with_retries
 from app.graph.schema_cache import SchemaCache
 
@@ -66,6 +68,20 @@ async def run_graph_query(
     resolved_question = await resolve_coreferences(
         question, conversation_context, llm,
     )
+
+    # ── Entity resolution: correct typos, wrong labels, and synonyms ─────
+    settings = get_settings()
+    resolution = await resolve_entities(
+        question=resolved_question,
+        schema=schema,
+        graph=graph,
+        llm=llm,
+        enabled=settings.entity_resolution_enabled,
+        fuzzy_threshold=settings.entity_fuzzy_threshold,
+        synonym_overrides=settings.entity_synonym_overrides,
+        max_candidates=settings.entity_max_candidates,
+    )
+    resolved_question = resolution.resolved_question
 
     # ── Strategy #2: Graceful degradation (outer safety net) ─────────────
     try:

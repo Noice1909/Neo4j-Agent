@@ -83,7 +83,9 @@ def build_agent_graph(
         "- When you have enough context, use your tools and respond with a "
         "direct, conversational answer.\n"
         "- If something goes wrong internally, just say you couldn't find the "
-        "information — never expose error details or suggest query formatting."
+        "information — never expose error details or suggest query formatting.\n"
+        "- The system may automatically correct minor typos or alternate names "
+        "in the user's question. Trust and use the corrected form when querying."
     ))
 
     # ── Nodes ─────────────────────────────────────────────────────────────────────────

@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     query_cache_ttl_seconds: int = 1800     # 30-minute TTL for cached responses
     query_dedup_enabled: bool = True        # Master switch for dedup layer
 
+    # ── Entity Resolution ────────────────────────────────────────────────────
+    entity_resolution_enabled: bool = True       # Master switch for entity correction
+    entity_fuzzy_threshold: float = 0.75         # Levenshtein similarity cutoff (0.0–1.0)
+    entity_synonym_overrides: str = ""           # JSON string of custom synonyms
+    entity_max_candidates: int = 5               # Max candidates from DB lookup
+
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "Neo4j Agent"
     debug: bool = False
