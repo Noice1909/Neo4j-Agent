@@ -35,7 +35,7 @@ from src.agent.checkpointer import close_checkpointer, init_checkpointer
 from src.agent.factory import get_compiled_agent, init_agent
 from src.api.routes import chat, health, schema, sessions
 from src.core.config import Settings, get_settings
-from src.core.dependencies import set_schema_cache_instance
+from src.core.dependencies import set_schema_cache_instance, set_query_dedup_instance
 from src.core.exceptions import (
     AgentError,
     ReadOnlyViolationError,
@@ -59,6 +59,7 @@ from src.mcp.tools.schema_info import build_schema_info_tool
 from src.mcp.tools.vector_search import build_vector_search_tool
 from src.middleware.auth import APIKeyMiddleware
 from src.middleware.rate_limit import limiter
+from src.services.query_dedup import QueryDeduplicator
 
 try:
     from prometheus_fastapi_instrumentator import Instrumentator
@@ -110,6 +111,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from langchain.cache import InMemoryCache  # type: ignore[no-redef]
     set_llm_cache(InMemoryCache())
     logger.info("LLM cache: InMemoryCache (per-process).")
+
+    # ── 4b. Query deduplicator (in-memory) ────────────────────────────────────
+    if settings.query_dedup_enabled:
+        query_dedup = QueryDeduplicator(
+            ttl_seconds=settings.query_cache_ttl_seconds,
+            enabled=True,
+        )
+        set_query_dedup_instance(query_dedup)
+        logger.info(
+            "Query deduplication ENABLED (TTL=%ds, in-memory).",
+            settings.query_cache_ttl_seconds,
+        )
+    else:
+        query_dedup = QueryDeduplicator(enabled=False)
+        set_query_dedup_instance(query_dedup)
+        logger.info("Query deduplication DISABLED.")
 
     # ── 5. Build LangChain tools ──────────────────────────────────────────────
     logger.info("[5/8] Building LangChain tools...")

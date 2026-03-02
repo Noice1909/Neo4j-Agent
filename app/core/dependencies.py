@@ -24,9 +24,13 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph as CompiledGraph
 
     from app.graph.schema_cache import SchemaCache
+    from app.services.query_dedup import QueryDeduplicator
 
 # Module-level schema_cache reference — set during lifespan startup.
 _schema_cache_instance: "SchemaCache | None" = None
+
+# Module-level query dedup reference — set during lifespan startup.
+_query_dedup_instance: "QueryDeduplicator | None" = None
 
 
 def set_schema_cache_instance(sc: "SchemaCache") -> None:
@@ -40,6 +44,19 @@ def get_schema_cache_instance() -> "SchemaCache":
     if _schema_cache_instance is None:
         raise RuntimeError("SchemaCache has not been initialised.")
     return _schema_cache_instance
+
+
+def set_query_dedup_instance(qd: "QueryDeduplicator") -> None:
+    """Store the query dedup singleton (called once during lifespan startup)."""
+    global _query_dedup_instance
+    _query_dedup_instance = qd
+
+
+def get_query_dedup_instance() -> "QueryDeduplicator":
+    """Return the query dedup singleton (raises if not yet initialised)."""
+    if _query_dedup_instance is None:
+        raise RuntimeError("QueryDeduplicator has not been initialised.")
+    return _query_dedup_instance
 
 
 # ── FastAPI Depends providers ─────────────────────────────────────────────────
@@ -76,3 +93,8 @@ def get_agent() -> "CompiledGraph":
     from app.agent.factory import get_compiled_agent
 
     return get_compiled_agent()
+
+
+def get_query_dedup() -> "QueryDeduplicator":
+    """Return the query deduplicator singleton."""
+    return get_query_dedup_instance()

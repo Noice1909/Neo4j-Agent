@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     schema_cache_ttl_seconds: int = 300
     llm_cache_ttl_seconds: int = 3600
 
+    # ── Query Deduplication ──────────────────────────────────────────────────
+    query_cache_ttl_seconds: int = 1800     # 30-minute TTL for cached responses
+    query_dedup_enabled: bool = True        # Master switch for dedup layer
+
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "Neo4j Agent"
     debug: bool = False

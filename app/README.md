@@ -29,7 +29,8 @@ app/
 │       ├── health.py              # Health-check models
 │       └── sessions.py            # Session models
 ├── services/
-│   └── graph_query.py             # Orchestration: query → agent → response
+│   ├── graph_query.py             # Orchestration: query → agent → response
+│   └── query_dedup.py             # Query deduplication (Redis cache + in-flight coalescing)
 ├── agent/
 │   ├── state.py                   # AgentState TypedDict
 │   ├── graph.py                   # LangGraph StateGraph (tool-calling agent)
@@ -63,8 +64,9 @@ app/
 | **LangGraph** | Stateful agent with tool-calling loop and Redis checkpoints |
 | **LangChain** | `GraphCypherQAChain` for natural language → Cypher → answer |
 | **Neo4j** | Knowledge graph database (movies, actors, directors) |
-| **Redis** | Session persistence (checkpointer) + schema cache |
+| **Redis** | Session persistence (checkpointer) + schema cache + query dedup cache |
 | **Ollama** | Local LLM inference (default: `qwen2.5:latest`) |
+| **Query Dedup** | Two-layer deduplication: Redis response cache + in-flight coalescing |
 | **FastMCP** | Model Context Protocol server mounted at `/mcp` |
 | **Prometheus** | Metrics endpoint at `/metrics` |
 
@@ -72,9 +74,12 @@ app/
 
 ```
 Client → FastAPI → APIKeyMiddleware → RateLimiter
-  → /chat route → graph_query service → LangGraph agent
-    → tool call → GraphCypherQAChain → Cypher → Neo4j
-    → LLM generates answer → response
+  → /chat route → QueryDeduplicator
+    → [CACHE HIT]  → return cached response (no LLM call)
+    → [IN-FLIGHT]  → await existing invocation (shared Future)
+    → [CACHE MISS]  → LangGraph agent
+      → tool call → GraphCypherQAChain → Cypher → Neo4j
+      → LLM generates answer → cache result → response
 ```
 
 ---
@@ -142,6 +147,8 @@ Optional variables:
 | `RATE_LIMIT_GENERAL` | `30/minute` | General rate limit |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `DEBUG` | `false` | Debug mode |
+| `QUERY_CACHE_TTL_SECONDS` | `1800` | Query dedup response cache TTL (30 min) |
+| `QUERY_DEDUP_ENABLED` | `true` | Enable/disable query deduplication |
 
 ### 4. Start Services
 
@@ -236,6 +243,7 @@ curl http://localhost:8000/health/ready
 ## Project Highlights
 
 - **Read-only Cypher safety** — All generated queries are validated to prevent writes
+- **Query deduplication** — Two-layer dedup reduces redundant LLM calls (Redis response cache + in-flight coalescing)
 - **Automatic retry** — Exponential backoff on transient Neo4j/LLM failures
 - **Session persistence** — Conversations persist across restarts via Redis
 - **Rate limiting** — Per-endpoint configurable limits via SlowAPI
