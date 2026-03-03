@@ -84,6 +84,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Startup happens before yield; shutdown happens after.
     """
     settings: Settings = get_settings()
+
+    # ── 0. Structured logging (must run AFTER uvicorn configures its loggers) ─
+    from app.core.logging import setup_logging
+    setup_logging(settings.log_level, settings=settings)
+
     logger.info("═══ %s — startup ═══", settings.app_name)
 
     # ── 1. Neo4j ──────────────────────────────────────────────────────────────

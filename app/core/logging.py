@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any
 
 import structlog
 
 
-def setup_logging(log_level: str = "INFO") -> None:
+def setup_logging(log_level: str = "INFO", settings: Any = None) -> None:
     """
     Configure structured JSON logging for the entire application.
 
@@ -30,7 +31,23 @@ def setup_logging(log_level: str = "INFO") -> None:
     ----------
     log_level:
         Root log level string (e.g. "DEBUG", "INFO", "WARNING").
+    settings:
+        Optional ``Settings`` instance.  When provided, all ``.env`` values
+        are automatically masked in every log message.
     """
+    # ── Sensitive data masking ────────────────────────────────────────────
+    # Wraps sys.stderr / sys.stdout so every string that hits the terminal
+    # passes through _replace_secrets().  Works regardless of handler/formatter.
+    if settings is not None:
+        from app.core.masking import (
+            init_masking, install_stream_masking, mask_sensitive_processor,
+        )
+        init_masking(settings)
+        install_stream_masking()
+        masking_processors: list[structlog.types.Processor] = [mask_sensitive_processor]
+    else:
+        masking_processors = []
+
     # Shared processors for both structlog and stdlib loggers.
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
@@ -39,6 +56,7 @@ def setup_logging(log_level: str = "INFO") -> None:
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
+        *masking_processors,
     ]
 
     structlog.configure(

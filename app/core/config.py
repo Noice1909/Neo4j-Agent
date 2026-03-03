@@ -82,6 +82,4 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return a singleton Settings instance (cached after first call)."""
     settings = Settings()  # type: ignore[call-arg]  # pydantic-settings fills from env
-    from app.core.logging import setup_logging
-    setup_logging(settings.log_level)
     return settings
