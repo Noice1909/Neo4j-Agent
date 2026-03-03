@@ -156,76 +156,78 @@ class LabelResolver:
 
 
 # ── Layer 2: Entity Name Resolution ──────────────────────────────────────────
+#
+# Optimised for **read-only access** and **large databases** (3M+ nodes).
+#
+# Resolution strategy (fastest → slowest):
+#   2a) Full-text index (Lucene)   — if admin pre-created it  (~1 ms)
+#   2b) APOC multi-signal scoring  — label-scoped              (~50-500 ms)
+#   2c) APOC phonetic matching     — catches sounds-alike      (~50-500 ms)
+#
+# No indexes are created; no data is written.
 
-# Default full-text index name used for entity name lookups.
+# Default full-text index name.  Configurable via ENTITY_FULLTEXT_INDEX_NAME.
 FULLTEXT_INDEX_NAME = "entityNameIndex"
 
 
-def ensure_fulltext_index(graph: Any, schema: str) -> bool:
+def detect_fulltext_index(graph: Any, index_name: str = FULLTEXT_INDEX_NAME) -> bool:
     """
-    Ensure a full-text index exists for entity name resolution.
+    Check whether a full-text index exists (read-only probe).
 
-    Attempts to create the index if it doesn't exist.  Returns True if
-    the index is available, False otherwise (e.g. insufficient permissions).
-
-    The index covers all node labels found in the schema across common
-    name properties: ``name``, ``title``.
+    If the index is missing, logs the CREATE statement the admin should run.
     """
     try:
-        # Check if index already exists
         existing = graph.query(
-            "SHOW FULLTEXT INDEXES WHERE name = $name",
-            params={"name": FULLTEXT_INDEX_NAME},
+            "SHOW FULLTEXT INDEXES YIELD name WHERE name = $name RETURN name",
+            params={"name": index_name},
         )
         if existing:
+            logger.info("Full-text index '%s' detected — Layer 2a enabled.", index_name)
             return True
     except Exception:
-        # SHOW INDEXES may not be available on all Neo4j versions
+        # SHOW INDEXES may fail on older Neo4j versions — not fatal
         pass
 
-    # Extract labels from the schema to build the index
-    labels: list[str] = []
-    for match in re.finditer(r"^\s*(\w+)\s*\{", schema, re.MULTILINE):
-        label = match.group(1)
-        if label not in ("Node", "Relationship", "The"):
-            labels.append(label)
-
-    if not labels:
-        logger.warning("No labels found in schema; cannot create full-text index.")
-        return False
-
-    # Build the CREATE INDEX statement
-    label_list = "|".join(labels)
-    create_stmt = (
-        f"CREATE FULLTEXT INDEX {FULLTEXT_INDEX_NAME} IF NOT EXISTS "
-        f"FOR (n:{label_list}) ON EACH [n.name, n.title]"
+    logger.warning(
+        "Full-text index '%s' NOT found. Layer 2 will use APOC fallback "
+        "(slower on large databases). Ask your Neo4j admin to run:\n"
+        "  CREATE FULLTEXT INDEX %s IF NOT EXISTS\n"
+        "  FOR (n) ON EACH [n.name, n.title]",
+        index_name, index_name,
     )
+    return False
 
+
+def _check_apoc_available(graph: Any) -> bool:
+    """Check whether APOC text procedures are installed."""
     try:
-        graph.query(create_stmt)
-        logger.info(
-            "Created full-text index '%s' on labels [%s] for properties [name, title].",
-            FULLTEXT_INDEX_NAME, label_list,
+        graph.query(
+            "RETURN apoc.text.levenshteinSimilarity('a', 'b') AS sim",
         )
         return True
-    except Exception as exc:
+    except Exception:
         logger.warning(
-            "Could not create full-text index '%s': %s. "
-            "Layer 2 will use fallback CONTAINS query.",
-            FULLTEXT_INDEX_NAME, exc,
+            "APOC text functions not available. "
+            "Layer 2b/2c (APOC fallback) disabled.",
         )
         return False
 
 
 class EntityNameResolver:
     """
-    Resolve typos in entity names by querying Neo4j for close matches.
+    Resolve typos in entity names via Neo4j lookups.
 
-    Uses a **full-text index** (Lucene-backed) for sub-millisecond lookups
-    that scale to millions of nodes.  Falls back to a ``CONTAINS`` query
-    if the full-text index is unavailable.
+    Designed for **read-only accounts** and **3M+ node databases**:
 
-    Results are cached in an LRU cache to avoid repeated DB hits.
+    - **2a — Full-text index** (if admin created ``entityNameIndex``):
+      Uses Lucene fuzzy ``~`` operator.  Sub-millisecond, zero RAM.
+    - **2b — APOC multi-signal** (no index, APOC available):
+      Label-scoped query using averaged Levenshtein + Sørensen-Dice
+      + Jaro-Winkler scores.
+    - **2c — APOC phonetic** (sounds-alike fallback):
+      doubleMetaphone matching for phonetically similar names.
+
+    All queries are LRU-cached (256 entries) to avoid repeated DB hits.
     """
 
     def __init__(
@@ -234,11 +236,20 @@ class EntityNameResolver:
         schema: str = "",
         fuzzy_threshold: float = 0.75,
         max_candidates: int = 5,
+        fulltext_index_name: str = FULLTEXT_INDEX_NAME,
     ) -> None:
         self._graph = graph
+        self._schema = schema
         self._fuzzy_threshold = fuzzy_threshold
         self._max_candidates = max_candidates
-        self._has_fulltext_index = ensure_fulltext_index(graph, schema) if schema else False
+        self._index_name = fulltext_index_name
+
+        # Detect capabilities once (read-only probes)
+        self._has_fulltext = detect_fulltext_index(graph, fulltext_index_name) if schema else False
+        self._has_apoc = _check_apoc_available(graph) if (schema and not self._has_fulltext) else False
+
+        # Extract labels from schema for label-scoped APOC queries
+        self._labels = LabelResolver._extract_labels(schema) if schema else []
 
     async def resolve(
         self, question: str, known_labels: list[str],
@@ -253,9 +264,12 @@ class EntityNameResolver:
         if not candidates:
             return question, corrections
 
+        # Use labels from Layer 1 if available, otherwise from schema
+        target_labels = known_labels or self._labels
+
         resolved_question = question
         for candidate in candidates:
-            match = await self._find_closest_match(candidate)
+            match = await self._find_closest_match(candidate, target_labels)
             if match and match.lower() != candidate.lower():
                 similarity = difflib.SequenceMatcher(
                     None, candidate.lower(), match.lower(),
@@ -290,19 +304,20 @@ class EntityNameResolver:
 
         return candidates
 
+    # ── 2a: Full-text index query ────────────────────────────────────────
+
     @lru_cache(maxsize=256)
     def _fulltext_query(self, candidate: str) -> list[dict]:
         """
-        Query using Neo4j full-text index with Lucene fuzzy matching.
+        Lucene fuzzy search via pre-existing full-text index.
 
-        The ``~`` suffix enables Lucene edit-distance matching,
-        which handles typos efficiently at any database scale.
+        Uses the ``~`` operator for edit-distance matching.
+        Performance: ~1 ms regardless of database size.
         """
-        # Escape Lucene special chars and append fuzzy operator
         escaped = re.sub(r'([+\-&|!(){}[\]^"~*?:\\/ ])', r"\\\1", candidate)
         search_term = f"{escaped}~"
         cypher = (
-            f"CALL db.index.fulltext.queryNodes('{FULLTEXT_INDEX_NAME}', $term) "
+            f"CALL db.index.fulltext.queryNodes($indexName, $term) "
             "YIELD node, score "
             "RETURN labels(node)[0] AS label, "
             "COALESCE(node.name, node.title) AS name, score "
@@ -311,20 +326,78 @@ class EntityNameResolver:
         try:
             return self._graph.query(
                 cypher,
-                params={"term": search_term, "limit": self._max_candidates},
+                params={
+                    "indexName": self._index_name,
+                    "term": search_term,
+                    "limit": self._max_candidates,
+                },
             )
         except Exception as exc:
             logger.warning("Full-text entity lookup failed: %s", exc)
             return []
 
+    # ── 2b: APOC multi-signal query (label-scoped) ──────────────────────
+
     @lru_cache(maxsize=256)
-    def _fallback_query(self, candidate_lower: str) -> list[dict]:
-        """Fallback CONTAINS query when full-text index is unavailable."""
+    def _apoc_multi_signal_query(
+        self, candidate_lower: str, label: str,
+    ) -> list[dict]:
+        """
+        Label-scoped APOC query combining three similarity metrics.
+
+        Averages Levenshtein, Sørensen-Dice, and Jaro-Winkler scores
+        to produce a robust composite similarity.  Only scans nodes
+        of the given label — critical for 3M+ databases.
+        """
         cypher = (
-            "MATCH (n) "
-            "WHERE toLower(COALESCE(n.name, n.title, '')) CONTAINS $candidate "
-            "RETURN labels(n)[0] AS label, "
-            "COALESCE(n.name, n.title) AS name "
+            f"MATCH (n:`{label}`) "
+            "WHERE n.name IS NOT NULL "
+            "WITH n, "
+            "  apoc.text.levenshteinSimilarity(toLower(n.name), $candidate) AS levSim, "
+            "  apoc.text.sorensenDiceSimilarity(toLower(n.name), $candidate) AS sdSim, "
+            "  apoc.text.jaroWinklerDistance(toLower(n.name), $candidate) AS jwSim "
+            "WITH n, (levSim + sdSim + jwSim) / 3.0 AS avgScore "
+            "WHERE avgScore > $threshold "
+            "RETURN labels(n)[0] AS label, n.name AS name, avgScore AS score "
+            "ORDER BY avgScore DESC "
+            "LIMIT $limit"
+        )
+        try:
+            return self._graph.query(
+                cypher,
+                params={
+                    "candidate": candidate_lower,
+                    "threshold": self._fuzzy_threshold,
+                    "limit": self._max_candidates,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "APOC multi-signal lookup failed for label '%s': %s",
+                label, exc,
+            )
+            return []
+
+    # ── 2c: APOC phonetic query (label-scoped) ──────────────────────────
+
+    @lru_cache(maxsize=256)
+    def _apoc_phonetic_query(
+        self, candidate_lower: str, label: str,
+    ) -> list[dict]:
+        """
+        Phonetic matching via APOC doubleMetaphone.
+
+        Catches "sounds-alike" cases that edit-distance misses, e.g.
+        "Keanu Reaves" → "Keanu Reeves".  Only scans the target label.
+        """
+        cypher = (
+            f"MATCH (n:`{label}`) "
+            "WHERE n.name IS NOT NULL "
+            "WITH n, "
+            "  apoc.text.doubleMetaphone(n.name) AS nodePhonetic, "
+            "  apoc.text.doubleMetaphone($candidate) AS queryPhonetic "
+            "WHERE nodePhonetic = queryPhonetic "
+            "RETURN labels(n)[0] AS label, n.name AS name "
             "LIMIT $limit"
         )
         try:
@@ -336,26 +409,64 @@ class EntityNameResolver:
                 },
             )
         except Exception as exc:
-            logger.warning("Fallback entity name lookup failed: %s", exc)
+            logger.warning(
+                "APOC phonetic lookup failed for label '%s': %s",
+                label, exc,
+            )
             return []
 
-    async def _find_closest_match(self, candidate: str) -> str | None:
-        """Find the closest matching entity name in Neo4j."""
+    # ── Resolution orchestration ─────────────────────────────────────────
+
+    async def _find_closest_match(
+        self, candidate: str, labels: list[str],
+    ) -> str | None:
+        """
+        Try each sub-layer in order until a confident match is found.
+
+        2a (full-text) → 2b (APOC multi-signal) → 2c (APOC phonetic).
+        """
         loop = asyncio.get_running_loop()
 
-        if self._has_fulltext_index:
+        # ── 2a: Full-text index (fastest) ────────────────────────────────
+        if self._has_fulltext:
             results = await loop.run_in_executor(
                 None, self._fulltext_query, candidate,
             )
-        else:
-            results = await loop.run_in_executor(
-                None, self._fallback_query, candidate.lower(),
-            )
+            best = self._pick_best(results, candidate)
+            if best:
+                return best
 
+        # ── 2b: APOC multi-signal (label-scoped) ────────────────────────
+        if self._has_apoc and labels:
+            for label in labels:
+                results = await loop.run_in_executor(
+                    None, self._apoc_multi_signal_query,
+                    candidate.lower(), label,
+                )
+                best = self._pick_best(results, candidate)
+                if best:
+                    return best
+
+        # ── 2c: APOC phonetic (label-scoped) ─────────────────────────────
+        if self._has_apoc and labels:
+            for label in labels:
+                results = await loop.run_in_executor(
+                    None, self._apoc_phonetic_query,
+                    candidate.lower(), label,
+                )
+                best = self._pick_best(results, candidate)
+                if best:
+                    return best
+
+        return None
+
+    def _pick_best(
+        self, results: list[dict], candidate: str,
+    ) -> str | None:
+        """Select the best matching name from query results."""
         if not results:
             return None
 
-        # Find the best match by similarity
         best_match: str | None = None
         best_score = 0.0
 
@@ -432,6 +543,7 @@ async def resolve_entities(
     fuzzy_threshold: float = 0.75,
     synonym_overrides: str = "",
     max_candidates: int = 5,
+    fulltext_index_name: str = FULLTEXT_INDEX_NAME,
 ) -> ResolutionResult:
     """
     Run the 3-layer entity resolution pipeline.
@@ -496,6 +608,7 @@ async def resolve_entities(
             schema=schema,
             fuzzy_threshold=fuzzy_threshold,
             max_candidates=max_candidates,
+            fulltext_index_name=fulltext_index_name,
         )
         current_question, name_corrections = await name_resolver.resolve(
             current_question,

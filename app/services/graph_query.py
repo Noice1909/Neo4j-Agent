@@ -80,6 +80,7 @@ async def run_graph_query(
         fuzzy_threshold=settings.entity_fuzzy_threshold,
         synonym_overrides=settings.entity_synonym_overrides,
         max_candidates=settings.entity_max_candidates,
+        fulltext_index_name=settings.entity_fulltext_index_name,
     )
     resolved_question = resolution.resolved_question
 
