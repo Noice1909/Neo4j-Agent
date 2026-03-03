@@ -45,7 +45,9 @@ app/
 │       ├── prompts.py             # Enhanced Cypher generation prompt
 │       ├── retry.py               # Tenacity retry with exponential backoff
 │       ├── coreference.py         # Pronoun/coreference resolution
-│       └── callback.py            # CypherSafetyCallback for LangChain
+│       ├── callback.py            # CypherSafetyCallback for LangChain
+│       ├── synonyms.py            # Label synonym map (auto + custom)
+│       └── entity_resolver.py     # 3-layer entity resolution pipeline
 ├── llm/
 │   └── factory.py                 # Ollama LLM factory
 └── mcp/
@@ -67,6 +69,7 @@ app/
 | **Redis** | Session persistence (checkpointer) + schema cache + query dedup cache |
 | **Ollama** | Local LLM inference (default: `qwen2.5:latest`) |
 | **Query Dedup** | Two-layer deduplication: Redis response cache + in-flight coalescing |
+| **Entity Resolution** | 3-layer pipeline: label matching → APOC fuzzy → LLM fallback |
 | **FastMCP** | Model Context Protocol server mounted at `/mcp` |
 | **Prometheus** | Metrics endpoint at `/metrics` |
 
@@ -77,9 +80,79 @@ Client → FastAPI → APIKeyMiddleware → RateLimiter
   → /chat route → QueryDeduplicator
     → [CACHE HIT]  → return cached response (no LLM call)
     → [IN-FLIGHT]  → await existing invocation (shared Future)
-    → [CACHE MISS]  → LangGraph agent
-      → tool call → GraphCypherQAChain → Cypher → Neo4j
+    → [CACHE MISS]
+      → Coreference Resolution (resolve pronouns from history)
+      → Entity Resolution Pipeline
+        → Layer 1: Label/category correction (synonym map + fuzzy match)
+        → Layer 2a: Full-text index lookup (if admin-created)
+        → Layer 2b: APOC multi-signal (Levenshtein + Sørensen-Dice + Jaro-Winkler)
+        → Layer 2c: APOC phonetic (doubleMetaphone)
+        → Layer 3: LLM fallback (only if no corrections found)
+      → LangGraph agent → Cypher → Neo4j
       → LLM generates answer → cache result → response
+```
+
+### Entity Resolution Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI
+    participant QD as QueryDeduplicator
+    participant CR as Coreference Resolver
+    participant ER as Entity Resolution
+    participant L1 as Layer 1: Label Resolver
+    participant L2 as Layer 2: Name Resolver
+    participant L3 as Layer 3: LLM Fallback
+    participant Neo4j as Neo4j
+    participant LLM as LLM (Ollama)
+
+    C->>API: POST /chat {message, session_id}
+    API->>QD: Check cache / in-flight
+    alt Cache Hit
+        QD-->>API: Cached response
+        API-->>C: JSON response
+    else Cache Miss
+        QD->>CR: Resolve coreferences
+        CR->>LLM: Resolve pronouns from history
+        CR-->>QD: Resolved question
+        QD->>ER: resolve_entities(question, schema)
+
+        ER->>L1: Fuzzy match labels & synonyms
+        L1-->>ER: Label corrections (if any)
+
+        alt Full-text index exists
+            ER->>L2: db.index.fulltext.queryNodes()
+            L2->>Neo4j: Lucene fuzzy search (~)
+            Neo4j-->>L2: Matching entities
+        else APOC available
+            ER->>L2: APOC multi-signal query
+            L2->>Neo4j: levenshteinSim + sorensenDiceSim + jaroWinkler
+            Neo4j-->>L2: Scored candidates
+            alt No match found
+                ER->>L2: APOC phonetic query
+                L2->>Neo4j: doubleMetaphone comparison
+                Neo4j-->>L2: Phonetic matches
+            end
+        end
+        L2-->>ER: Name corrections (if any)
+
+        alt No corrections from Layer 1 & 2
+            ER->>L3: LLM fallback
+            L3->>LLM: Rewrite question using schema
+            LLM-->>L3: Corrected question
+            L3-->>ER: LLM correction
+        end
+
+        ER-->>QD: Corrected question
+        QD->>LLM: Generate Cypher query
+        LLM->>Neo4j: Execute Cypher
+        Neo4j-->>LLM: Query results
+        LLM-->>QD: Natural language answer
+        QD->>QD: Cache response
+        QD-->>API: Response
+        API-->>C: JSON response
+    end
 ```
 
 ---
@@ -149,6 +222,11 @@ Optional variables:
 | `DEBUG` | `false` | Debug mode |
 | `QUERY_CACHE_TTL_SECONDS` | `1800` | Query dedup response cache TTL (30 min) |
 | `QUERY_DEDUP_ENABLED` | `true` | Enable/disable query deduplication |
+| `ENTITY_RESOLUTION_ENABLED` | `true` | Enable/disable entity resolution pipeline |
+| `ENTITY_FUZZY_THRESHOLD` | `0.75` | Similarity cutoff for fuzzy matching (0.0–1.0) |
+| `ENTITY_SYNONYM_OVERRIDES` | `` | JSON string of custom label synonyms |
+| `ENTITY_MAX_CANDIDATES` | `5` | Max candidates per DB lookup |
+| `ENTITY_FULLTEXT_INDEX_NAME` | `entityNameIndex` | Name of admin-created full-text index |
 
 ### 4. Start Services
 
@@ -244,6 +322,9 @@ curl http://localhost:8000/health/ready
 
 - **Read-only Cypher safety** — All generated queries are validated to prevent writes
 - **Query deduplication** — Two-layer dedup reduces redundant LLM calls (Redis response cache + in-flight coalescing)
+- **Dynamic entity resolution** — 3-layer pipeline corrects typos, wrong labels, and ambiguous names before Cypher generation
+- **Read-only Neo4j compatible** — No write operations; works with read-only accounts on 3M+ node databases
+- **APOC-powered fuzzy matching** — Levenshtein + Sørensen-Dice + Jaro-Winkler + phonetic matching
 - **Automatic retry** — Exponential backoff on transient Neo4j/LLM failures
 - **Session persistence** — Conversations persist across restarts via Redis
 - **Rate limiting** — Per-endpoint configurable limits via SlowAPI
@@ -251,3 +332,30 @@ curl http://localhost:8000/health/ready
 - **Structured logging** — JSON logs via structlog for observability
 - **Prometheus metrics** — Built-in metrics instrumentation
 - **MCP support** — Model Context Protocol server for tool interoperability
+
+---
+
+## Entity Resolution (Query Correction)
+
+The entity resolution pipeline automatically corrects user queries before Cypher generation. It runs entirely with **read-only Neo4j access** and scales to **3M+ nodes**.
+
+### Pipeline Layers
+
+| Layer | Strategy | Latency | Example |
+|---|---|---|---|
+| **1 — Label** | Schema-aware synonym map + fuzzy matching | < 1 ms | "movies" → `Movie`, "actors" → `Person` |
+| **2a — Full-text** | Lucene index (admin-created) | ~ 1 ms | "Matrx" → "The Matrix" |
+| **2b — APOC Multi-signal** | Levenshtein + Sørensen-Dice + Jaro-Winkler | 50-500 ms | "Tom Hankes" → "Tom Hanks" |
+| **2c — APOC Phonetic** | `doubleMetaphone` matching | 50-500 ms | "Keanu Reaves" → "Keanu Reeves" |
+| **3 — LLM Fallback** | LLM rewrites the question using schema | 1-2 s | Complex rewrites |
+
+### Admin Setup (Optional, Recommended)
+
+For optimal performance on large databases, ask your Neo4j admin to create a full-text index:
+
+```cypher
+CREATE FULLTEXT INDEX entityNameIndex IF NOT EXISTS
+FOR (n) ON EACH [n.name, n.title]
+```
+
+The app detects and uses this index automatically. Without it, the APOC fallback is used.
