@@ -92,6 +92,10 @@ Client → FastAPI → APIKeyMiddleware → RateLimiter
       → LLM generates answer → cache result → response
 ```
 
+### Entity Resolution Flow Diagram
+
+![Entity Resolution Pipeline Flow](../docs/images/entity_resolution_flow.png)
+
 ### Entity Resolution Sequence Diagram
 
 ```mermaid
