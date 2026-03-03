@@ -140,7 +140,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── 6. Compile LangGraph agent ────────────────────────────────────────────
     logger.info("[6/8] Compiling LangGraph agent...")
     from src.agent.checkpointer import get_checkpointer
-    init_agent(llm=llm, tools=tools, checkpointer=get_checkpointer())
+    init_agent(llm=llm, tools=tools, checkpointer=get_checkpointer(),
+               max_conversation_tokens=settings.max_conversation_tokens,
+               token_budget_reserve=settings.token_budget_reserve)
 
     # ── 7. Register FastMCP tools ─────────────────────────────────────────────
     logger.info("[7/8] Registering FastMCP tools...")

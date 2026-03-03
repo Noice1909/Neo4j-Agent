@@ -30,6 +30,9 @@ def init_agent(
     llm: BaseChatModel,
     tools: list,
     checkpointer: BaseCheckpointSaver,
+    *,
+    max_conversation_tokens: int = 100_000,
+    token_budget_reserve: int = 4096,
 ) -> None:
     """
     Build and cache the compiled LangGraph agent.
@@ -45,10 +48,20 @@ def init_agent(
         List of LangChain `BaseTool` instances to bind to the agent.
     checkpointer:
         An initialised `BaseCheckpointSaver` (e.g. `AsyncRedisSaver`).
+    max_conversation_tokens:
+        Maximum token budget for conversation history.
+    token_budget_reserve:
+        Tokens reserved for model output.
     """
     global _compiled_agent
     logger.info("Building LangGraph agent with %d tool(s)...", len(tools))
-    _compiled_agent = build_agent_graph(llm, tools, checkpointer)
+    _compiled_agent = build_agent_graph(
+        llm,
+        tools,
+        checkpointer,
+        max_conversation_tokens=max_conversation_tokens,
+        token_budget_reserve=token_budget_reserve,
+    )
     logger.info("LangGraph agent ready.")
 
 

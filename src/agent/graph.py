@@ -29,6 +29,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from src.agent.state import AgentState
+from src.agent.trimming import trim_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ def build_agent_graph(
     llm: BaseChatModel,
     tools: list[BaseTool],
     checkpointer: BaseCheckpointSaver,
+    *,
+    max_conversation_tokens: int = 100_000,
+    token_budget_reserve: int = 4096,
 ) -> "CompiledGraph":  # type: ignore[name-defined]
     """
     Compile and return the LangGraph agent.
@@ -52,6 +56,10 @@ def build_agent_graph(
         List of LangChain `BaseTool` instances the agent may call.
     checkpointer:
         LangGraph checkpoint saver for persistent session memory.
+    max_conversation_tokens:
+        Maximum token budget for conversation history sent to the LLM.
+    token_budget_reserve:
+        Tokens reserved for model output, subtracted from the budget.
 
     Returns
     -------
@@ -64,6 +72,7 @@ def build_agent_graph(
             )
     """
     model_with_tools = llm.bind_tools(tools)
+    effective_budget = max(max_conversation_tokens - token_budget_reserve, 1024)
 
     # System prompt: hide all implementation details from the user
     _SYSTEM_PROMPT = SystemMessage(content=(
@@ -96,6 +105,18 @@ def build_agent_graph(
         # Inject system prompt if not already present
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [_SYSTEM_PROMPT] + list(messages)
+
+        # ── Trim to fit context window ────────────────────────────────────
+        original_count = len(messages)
+        messages = trim_conversation(messages, max_tokens=effective_budget)
+        if len(messages) < original_count:
+            logger.info(
+                "Context window trim: %d → %d messages (budget=%d tokens).",
+                original_count,
+                len(messages),
+                effective_budget,
+            )
+
         logger.debug("Agent node: invoking model (messages=%d).", len(messages))
         response = await model_with_tools.ainvoke(messages)
         return {"messages": [response]}

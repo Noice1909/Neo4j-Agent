@@ -35,6 +35,7 @@ app/
 │   ├── state.py                   # AgentState TypedDict
 │   ├── graph.py                   # LangGraph StateGraph (tool-calling agent)
 │   ├── factory.py                 # Agent initialisation / compilation
+│   ├── trimming.py                # Token-based message trimming (context window)
 │   └── checkpointer.py            # Redis-backed LangGraph checkpointer
 ├── graph/
 │   ├── connection.py              # Neo4j driver management
@@ -63,7 +64,7 @@ app/
 | Layer | Purpose |
 |---|---|
 | **FastAPI** | Async HTTP server with lifespan, CORS, auth, rate limiting |
-| **LangGraph** | Stateful agent with tool-calling loop and Redis checkpoints |
+| **LangGraph** | Stateful agent with tool-calling loop, context window trimming, and Redis checkpoints |
 | **LangChain** | `GraphCypherQAChain` for natural language → Cypher → answer |
 | **Neo4j** | Knowledge graph database (movies, actors, directors) |
 | **Redis** | Session persistence (checkpointer) + schema cache + query dedup cache |
@@ -88,7 +89,11 @@ Client → FastAPI → APIKeyMiddleware → RateLimiter
         → Layer 2b: APOC multi-signal (Levenshtein + Sørensen-Dice + Jaro-Winkler)
         → Layer 2c: APOC phonetic (doubleMetaphone)
         → Layer 3: LLM fallback (only if no corrections found)
-      → LangGraph agent → Cypher → Neo4j
+      → LangGraph agent
+        → Context Window Trimming (token-budget sliding window)
+          → Pin: system prompt + first human message (topic anchor)
+          → Fill: most recent messages within token budget
+        → LLM with trimmed history → tool calls → Cypher → Neo4j
       → LLM generates answer → cache result → response
 ```
 
@@ -108,6 +113,8 @@ sequenceDiagram
     participant L1 as Layer 1: Label Resolver
     participant L2 as Layer 2: Name Resolver
     participant L3 as Layer 3: LLM Fallback
+    participant AG as LangGraph Agent
+    participant TM as Trimming
     participant Neo4j as Neo4j
     participant LLM as LLM (Ollama)
 
@@ -149,10 +156,18 @@ sequenceDiagram
         end
 
         ER-->>QD: Corrected question
-        QD->>LLM: Generate Cypher query
-        LLM->>Neo4j: Execute Cypher
+        QD->>AG: invoke(messages, thread_id)
+        Note over AG: Load full history from Redis checkpoint
+        AG->>TM: trim_conversation(messages, budget)
+        Note over TM: Pin: SystemPrompt + 1st HumanMessage
+        Note over TM: Fill: newest messages within budget
+        TM-->>AG: Trimmed messages (fits context window)
+        AG->>LLM: ainvoke(trimmed messages + tools)
+        LLM->>Neo4j: Execute Cypher (via tool call)
         Neo4j-->>LLM: Query results
-        LLM-->>QD: Natural language answer
+        LLM-->>AG: Natural language answer
+        Note over AG: Save full history to checkpoint (untrimmed)
+        AG-->>QD: Response
         QD->>QD: Cache response
         QD-->>API: Response
         API-->>C: JSON response
@@ -231,6 +246,8 @@ Optional variables:
 | `ENTITY_SYNONYM_OVERRIDES` | `` | JSON string of custom label synonyms |
 | `ENTITY_MAX_CANDIDATES` | `5` | Max candidates per DB lookup |
 | `ENTITY_FULLTEXT_INDEX_NAME` | `entityNameIndex` | Name of admin-created full-text index |
+| `MAX_CONVERSATION_TOKENS` | `100000` | Max token budget for conversation history sent to LLM |
+| `TOKEN_BUDGET_RESERVE` | `4096` | Tokens reserved for model output (subtracted from budget) |
 
 ### 4. Start Services
 
@@ -324,6 +341,7 @@ curl http://localhost:8000/health/ready
 
 ## Project Highlights
 
+- **Context window management** — Token-based sliding window trims history before each LLM call; pins system prompt + topic anchor; configurable budget via env vars
 - **Read-only Cypher safety** — All generated queries are validated to prevent writes
 - **Query deduplication** — Two-layer dedup reduces redundant LLM calls (Redis response cache + in-flight coalescing)
 - **Dynamic entity resolution** — 3-layer pipeline corrects typos, wrong labels, and ambiguous names before Cypher generation
@@ -363,3 +381,81 @@ FOR (n) ON EACH [n.name, n.title]
 ```
 
 The app detects and uses this index automatically. Without it, the APOC fallback is used.
+
+---
+
+## Context Window Management
+
+Long conversations can exceed the LLM's context window, causing failures or degraded output quality. The agent includes a **token-based sliding window** that trims conversation history before each LLM call.
+
+### How It Works
+
+```
+Full checkpoint history (Redis)             Trimmed history (sent to LLM)
+┌─────────────────────────────┐            ┌─────────────────────────────┐
+│ SystemMessage (prompt)      │  ── pin ──▶│ SystemMessage (prompt)      │
+│ HumanMessage #1 (topic)     │  ── pin ──▶│ HumanMessage #1 (topic)     │
+│ AIMessage #1                │  dropped   │                             │
+│ HumanMessage #2             │  dropped   │                             │
+│ AIMessage #2                │  dropped   │                             │
+│ ...                         │  dropped   │                             │
+│ HumanMessage #N-1           │  ── fit ──▶│ HumanMessage #N-1           │
+│ AIMessage #N-1              │  ── fit ──▶│ AIMessage #N-1              │
+│ ToolMessage (Neo4j results) │  ── fit ──▶│ ToolMessage (Neo4j results) │
+│ HumanMessage #N (latest)    │  ── fit ──▶│ HumanMessage #N (latest)    │
+└─────────────────────────────┘            └─────────────────────────────┘
+```
+
+### Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Trim at inference time only** | Full history stays in Redis checkpoint — trimming only occurs when building the prompt for `ainvoke()`. Adjusting the budget later doesn't lose data. |
+| **Pin system prompt** | Always preserved so the agent maintains its persona and rules. |
+| **Pin first human message** | Anchors the conversation topic, preventing context loss when old messages are trimmed. |
+| **Fill from newest** | Most recent messages are most relevant; old messages are dropped first. |
+| **Approximate token counting** | Uses ~4 chars/token estimator by default. Swap to `model.get_num_tokens()` for exact counting with specific LLM providers. |
+| **No summarization** | Adds LLM call latency and complexity. With large context windows (e.g. Gemini 1M+), trimming is primarily a safety net. |
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_CONVERSATION_TOKENS` | `100000` | Total token budget for conversation history |
+| `TOKEN_BUDGET_RESERVE` | `4096` | Tokens reserved for model output (subtracted from budget) |
+
+**Effective budget** = `MAX_CONVERSATION_TOKENS` - `TOKEN_BUDGET_RESERVE` (minimum 1024).
+
+### Monitoring
+
+When trimming occurs, the agent logs:
+
+```
+INFO  Context window trim: 47 → 12 messages (budget=95904 tokens).
+INFO  Trimmed conversation: kept 12/47 messages (dropped 35, budget=95904 tokens).
+```
+
+### Context Window Trimming Flow
+
+```mermaid
+flowchart TD
+    A[call_model receives full message history] --> B{SystemMessage at index 0?}
+    B -- No --> C[Prepend system prompt]
+    B -- Yes --> D[Keep as-is]
+    C --> E[Pin system prompt + first HumanMessage]
+    D --> E
+    E --> F[Calculate pinned token cost]
+    F --> G{Total tokens ≤ budget?}
+    G -- Yes --> H[Send all messages to LLM — no trimming needed]
+    G -- No --> I[Walk backwards from newest message]
+    I --> J{Message fits remaining budget?}
+    J -- Yes --> K[Add to tail list, subtract cost]
+    K --> J
+    J -- No --> L[Stop — budget exhausted]
+    L --> M[Assemble: pinned + tail messages]
+    M --> N[Log trim stats]
+    N --> O[Send trimmed messages to LLM]
+    H --> P[LLM generates response]
+    O --> P
+    P --> Q[Save full history to checkpoint — untrimmed]
+```

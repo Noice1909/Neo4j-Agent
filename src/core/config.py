@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # Temperature — lower = more deterministic Cypher generation
     ollama_temperature: float = 0.0
 
+    # ── Context Window Management ────────────────────────────────────────
+    # Max tokens for conversation history sent to the LLM.
+    # Set below your model's context window to leave room for output.
+    max_conversation_tokens: int = 100_000
+    # Tokens reserved for model output (subtracted from budget).
+    token_budget_reserve: int = 4096
+
     # ── Redis (optional — only used when checkpointer_backend="redis") ────────
     redis_url: str = "redis://localhost:6379"
 
