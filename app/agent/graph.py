@@ -93,7 +93,7 @@ def build_agent_graph(
     schema_labels: list[str] | None = None,
     max_conversation_tokens: int = 100_000,
     token_budget_reserve: int = 4096,
-) -> "CompiledGraph":  # type: ignore[name-defined]
+) -> CompiledGraph:
     """
     Compile and return the LangGraph agent.
 
