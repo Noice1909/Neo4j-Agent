@@ -16,7 +16,7 @@ _STATIC_PATTERN = (
     r"those|these|them|they|the\s+same|the\s+above|mentioned|previous"
 )
 
-_COREF_RE = re.compile(
+_coref_re = re.compile(
     rf"\b(?:{_STATIC_PATTERN})\b",
     re.IGNORECASE,
 )
@@ -61,13 +61,13 @@ def build_coreference_regex(schema_labels: list[str]) -> re.Pattern[str]:
 
 def set_coreference_regex(regex: re.Pattern[str]) -> None:
     """
-    Replace the module-level ``_COREF_RE`` with *regex*.
+    Replace the module-level ``_coref_re`` with *regex*.
 
     Call this at startup after topology extraction and on every topology
     refresh so coreference detection reflects the live schema labels.
     """
-    global _COREF_RE
-    _COREF_RE = regex
+    global _coref_re
+    _coref_re = regex
     logger.info("Coreference regex updated.")
 
 
@@ -76,7 +76,7 @@ def set_coreference_regex(regex: re.Pattern[str]) -> None:
 
 def has_coreferences(question: str) -> bool:
     """Detect referential / anaphoric language in a question."""
-    return bool(_COREF_RE.search(question))
+    return bool(_coref_re.search(question))
 
 
 async def resolve_coreferences(
