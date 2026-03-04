@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable
 from enum import Enum
+from typing import cast
 
 import httpx
 from fastapi import APIRouter
@@ -121,7 +123,7 @@ async def _check_redis() -> DependencyCheck:
 
         t0 = time.perf_counter()
         client = aioredis.from_url(settings.redis_url)
-        await client.ping()
+        await cast(Awaitable[bool], client.ping())
         await client.aclose()
         latency = round((time.perf_counter() - t0) * 1000, 2)
         return DependencyCheck(status=CheckStatus.ok, latency_ms=latency)

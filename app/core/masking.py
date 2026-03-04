@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import MutableMapping
 from typing import Any, TextIO
 
 # Fields whose values are never sensitive (safe to log as-is).
@@ -148,8 +149,8 @@ def install_stream_masking() -> None:
 
 
 def mask_sensitive_processor(
-    logger: Any, method_name: str, event_dict: dict[str, Any],
-) -> dict[str, Any]:
+    logger: Any, method_name: str, event_dict: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
     """Structlog processor: mask ``.env`` values in log events."""
     if not _sensitive_map:
         return event_dict

@@ -534,7 +534,7 @@ async def resolve_entities(
     question: str,
     schema: str,
     graph: Any,
-    llm: BaseChatModel,
+    llm: Any,
     *,
     enabled: bool = True,
     fuzzy_threshold: float = 0.75,
@@ -577,6 +577,7 @@ async def resolve_entities(
 
     all_corrections: list[Correction] = []
     current_question = question
+    label_resolver: LabelResolver | None = None
 
     # ── Layer 1: Label resolution ────────────────────────────────────────
     try:
