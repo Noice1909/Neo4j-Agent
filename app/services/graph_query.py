@@ -25,6 +25,7 @@ from app.graph.cypher.coreference import resolve_coreferences
 from app.graph.cypher.entity_resolution import resolve_entities
 from app.graph.cypher.retry import execute_with_retries
 from app.graph.schema_cache import SchemaCache
+from app.core.tracing import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ async def run_graph_query(
     graph = ensure_connected()
     schema = await schema_cache.get_schema()
     graph.schema = schema
-
+    trace_event("GRAPH_QUERY_START", "info", question[:100])
     # ── Strategy #5: Resolve coreferences ────────────────────────────────
     resolved_question = await resolve_coreferences(
         question, conversation_context, llm,
@@ -95,6 +96,7 @@ async def run_graph_query(
             "All Cypher attempts failed for %r: %s",
             question[:80], exc, exc_info=True,
         )
+        trace_event("GRAPH_QUERY_FALLBACK", "fail", f"Graceful degradation: {exc}"[:120])
         return (
             "I'm sorry, I couldn't find that information right now. "
             "Could you try asking in a different way?"

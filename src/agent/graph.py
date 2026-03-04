@@ -30,6 +30,7 @@ from langgraph.prebuilt import ToolNode
 
 from src.agent.state import AgentState
 from src.agent.trimming import trim_conversation
+from src.core.tracing import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +117,23 @@ def build_agent_graph(
                 len(messages),
                 effective_budget,
             )
+            trace_event(
+                "CONTEXT_TRIM", "warn",
+                f"{original_count} → {len(messages)} msgs (budget={effective_budget})",
+            )
 
         logger.debug("Agent node: invoking model (messages=%d).", len(messages))
+        trace_event("AGENT_LLM_CALL", "info", f"{len(messages)} messages")
         response = await model_with_tools.ainvoke(messages)
+
+        # Trace the LLM decision (tool call vs final answer)
+        tool_calls = getattr(response, "tool_calls", None)
+        if tool_calls:
+            tool_names = ", ".join(tc.get("name", "?") for tc in tool_calls)
+            trace_event("AGENT_DECISION", "info", f"Tool call(s): {tool_names}")
+        else:
+            trace_event("AGENT_DECISION", "ok", "Final answer")
+
         return {"messages": [response]}
 
     tool_node = ToolNode(tools=tools)

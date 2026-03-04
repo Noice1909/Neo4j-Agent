@@ -157,6 +157,8 @@ class QueryDeduplicator:
         cached = await self._get_cached(key)
         if cached is not None:
             logger.info("Query dedup CACHE HIT (key=%s…)", key[:12])
+            from app.core.tracing import trace_event
+            trace_event("DEDUP_CHECK", "ok", "CACHE HIT")
             return cached
 
         # ── Layer 2: in-flight coalescing ─────────────────────────────────
@@ -165,6 +167,8 @@ class QueryDeduplicator:
         async with self._lock:
             if key in self._in_flight:
                 logger.info("Query dedup IN-FLIGHT JOIN (key=%s…)", key[:12])
+                from app.core.tracing import trace_event
+                trace_event("DEDUP_CHECK", "ok", "IN-FLIGHT JOIN")
                 # Grab a reference BEFORE releasing the lock — the owner's
                 # ``finally`` block may remove the key at any moment.
                 existing_future = self._in_flight[key]
@@ -197,6 +201,8 @@ class QueryDeduplicator:
             if not future.done():
                 future.set_result(payload if payload is not None else result)
 
+            from app.core.tracing import trace_event
+            trace_event("DEDUP_CHECK", "info", "CACHE MISS → invoking agent")
             logger.info("Query dedup MISS → cached (key=%s…)", key[:12])
             return payload if payload is not None else result
 

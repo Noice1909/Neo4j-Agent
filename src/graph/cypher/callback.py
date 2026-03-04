@@ -10,6 +10,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 from src.graph.cypher.safety import validate_read_only
 from src.graph.cypher.validation import pre_validate_cypher
+from src.core.tracing import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,15 @@ class CypherSafetyCallback(BaseCallbackHandler):
             if query and isinstance(query, str):
                 self.last_generated_cypher = query
                 logger.debug("Pre-execution Cypher check: %s", query[:200])
+                trace_event("CYPHER_GENERATED", "info", query)
 
                 issues = pre_validate_cypher(query)
                 if issues:
+                    trace_event("CYPHER_VALIDATED", "fail", f"Pre-validation: {', '.join(issues)}")
                     raise ValueError(
                         f"Cypher pre-validation failed ({', '.join(issues)}): "
                         f"{query[:200]}"
                     )
 
                 validate_read_only(query)
+                trace_event("CYPHER_VALIDATED", "ok", "Read-only ✓  Syntax ✓")

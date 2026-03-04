@@ -30,7 +30,10 @@ async def resolve_coreferences(
     llm: BaseChatModel,
 ) -> str:
     """Rewrite a follow-up question as standalone by resolving coreferences."""
+    from src.core.tracing import trace_event
+
     if not conversation_context or not has_coreferences(question):
+        trace_event("COREFERENCE", "skip", "No coreferences detected")
         return question
 
     rewrite_prompt = (
@@ -50,7 +53,9 @@ async def resolve_coreferences(
 
     if rewritten and len(rewritten) > 5 and not rewritten.lower().startswith("i "):
         logger.info("Coreference resolved: %r → %r", question, rewritten)
+        trace_event("COREFERENCE", "ok", f"{question[:50]} → {rewritten[:50]}")
         return rewritten
 
     logger.warning("Coreference resolution produced dubious result; using original")
+    trace_event("COREFERENCE", "warn", "Dubious result; kept original")
     return question

@@ -19,6 +19,7 @@ from src.graph.cypher.entity_resolution.models import (
     ResolutionResult,
 )
 from src.graph.cypher.entity_resolution.name_resolver import EntityNameResolver
+from src.core.tracing import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,47 @@ async def llm_resolve(
         return resolved, corrections
 
     return question, corrections
+
+
+def _log_layer_result(
+    stage: str, layer_label: str,
+    corrections: list[Correction], skip_msg: str,
+) -> None:
+    """Trace + log the outcome of a resolution layer."""
+    if corrections:
+        logger.info("%s: %d correction(s)", layer_label, len(corrections))
+        trace_event(stage, "ok", f"{len(corrections)} correction(s)")
+    else:
+        trace_event(stage, "skip", skip_msg)
+
+
+async def _run_llm_fallback(
+    question: str,
+    current_question: str,
+    schema: str,
+    llm: BaseChatModel,
+) -> tuple[str, list[Correction]]:
+    """Run Layer 3 LLM entity resolution with error handling and tracing."""
+    try:
+        current_question, llm_corrections = await llm_resolve(
+            current_question, schema, llm,
+        )
+        if llm_corrections:
+            logger.info(
+                "Layer 3 (LLM): correction applied: %r → %r",
+                question, current_question,
+            )
+            trace_event(
+                "ENTITY_RES_L3", "ok",
+                f"{question[:40]} → {current_question[:40]}",
+            )
+        else:
+            trace_event("ENTITY_RES_L3", "skip", "LLM found no corrections")
+        return current_question, llm_corrections
+    except Exception as exc:
+        logger.warning("Layer 3 (LLM) resolution failed: %s", exc)
+        trace_event("ENTITY_RES_L3", "fail", str(exc)[:80])
+        return current_question, []
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -127,14 +169,10 @@ async def resolve_entities(
             current_question,
         )
         all_corrections.extend(label_corrections)
-        if label_corrections:
-            logger.info(
-                "Layer 1 (label): %d correction(s) applied: %s",
-                len(label_corrections),
-                [(c.original, c.corrected) for c in label_corrections],
-            )
+        _log_layer_result("ENTITY_RES_L1", "Layer 1 (label)", label_corrections, "No label corrections")
     except Exception as exc:
         logger.warning("Layer 1 (label) resolution failed: %s", exc)
+        trace_event("ENTITY_RES_L1", "fail", str(exc)[:80])
 
     # ── Layer 2: Entity name resolution ──────────────────────────────────
     try:
@@ -150,29 +188,19 @@ async def resolve_entities(
             known_labels=label_resolver._labels if label_resolver else [],
         )
         all_corrections.extend(name_corrections)
-        if name_corrections:
-            logger.info(
-                "Layer 2 (name): %d correction(s) applied: %s",
-                len(name_corrections),
-                [(c.original, c.corrected) for c in name_corrections],
-            )
+        _log_layer_result("ENTITY_RES_L2", "Layer 2 (name)", name_corrections, "No name corrections")
     except Exception as exc:
         logger.warning("Layer 2 (name) resolution failed: %s", exc)
+        trace_event("ENTITY_RES_L2", "fail", str(exc)[:80])
 
     # ── Layer 3: LLM fallback (only if no corrections so far) ────────────
     if not all_corrections:
-        try:
-            current_question, llm_corrections = await llm_resolve(
-                current_question, schema, llm,
-            )
-            all_corrections.extend(llm_corrections)
-            if llm_corrections:
-                logger.info(
-                    "Layer 3 (LLM): correction applied: %r → %r",
-                    question, current_question,
-                )
-        except Exception as exc:
-            logger.warning("Layer 3 (LLM) resolution failed: %s", exc)
+        current_question, llm_corr = await _run_llm_fallback(
+            question, current_question, schema, llm,
+        )
+        all_corrections.extend(llm_corr)
+    else:
+        trace_event("ENTITY_RES_L3", "skip", "Skipped (L1/L2 already corrected)")
 
     result = ResolutionResult(
         original_question=question,

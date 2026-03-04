@@ -23,6 +23,7 @@ from langchain_core.messages import HumanMessage
 
 from app.core.dependencies import get_agent, get_schema_cache, get_query_dedup
 from app.core.exceptions import AgentError, ReadOnlyViolationError
+from app.core.tracing import SessionTracer, set_tracer, trace_event
 from app.middleware.rate_limit import limiter
 from app.core.config import get_settings
 from app.api.schemas.chat import ChatRequest, ChatResponse
@@ -59,6 +60,11 @@ async def chat(
     Deduplication: identical queries from any user are served from cache.
     Concurrent identical queries share a single agent invocation.
     """
+    # ── Session tracing ───────────────────────────────────────────────
+    tracer = SessionTracer(session_id=str(body.session_id))
+    set_tracer(tracer)
+    tracer.record("USER_INPUT", "info", body.message[:120])
+
     logger.info("Chat request: session_id=%s message=%r", body.session_id, body.message[:80])
 
     config = {"configurable": {"thread_id": body.session_id}}
@@ -66,8 +72,12 @@ async def chat(
     try:
         result = await dedup.deduplicated_invoke(body.message, agent, config)
     except ReadOnlyViolationError:
+        tracer.record("ERROR", "fail", "Read-only violation")
+        tracer.print_journey()
         raise
     except Exception as exc:
+        tracer.record("ERROR", "fail", str(exc)[:120])
+        tracer.print_journey()
         logger.error(
             "Agent error (session=%s): %s", body.session_id, exc, exc_info=True
         )
@@ -88,6 +98,9 @@ async def chat(
         last_msg = messages[-1]
         if hasattr(last_msg, "usage_metadata") and last_msg.usage_metadata:
             tokens_used = last_msg.usage_metadata.get("total_tokens")
+
+    tracer.record("RESPONSE", "ok", answer[:120])
+    tracer.print_journey()
 
     logger.info(
         "Chat response: session_id=%s answer=%r (tokens=%s)",

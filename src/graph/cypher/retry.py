@@ -23,6 +23,7 @@ from src.graph.cypher.prompts import ENHANCED_CYPHER_PROMPT
 from src.graph.cypher.safety import validate_read_only
 from src.graph.cypher.validation import pre_validate_cypher
 from src.core.exceptions import ReadOnlyViolationError
+from src.core.tracing import trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ async def _run_initial_chain(
 
     answer: str = result.get("result", "I could not determine an answer.")
     logger.info("Graph query answered: %r → %r", question[:60], answer[:120])
+    trace_event("CYPHER_EXECUTED", "ok", f"Attempt 0 succeeded: {answer[:80]}")
     return answer
 
 
@@ -154,6 +156,7 @@ async def _run_correction_attempt(
     )
     corrected_cypher = strip_code_fences(str(resp.content))
     logger.info("Retry %d corrected Cypher: %s", attempt, corrected_cypher[:200])
+    trace_event("CYPHER_CORRECTION", "info", f"Retry {attempt}: {corrected_cypher}")
 
     validate_read_only(corrected_cypher)
     issues = pre_validate_cypher(corrected_cypher)
@@ -177,6 +180,7 @@ async def _run_correction_attempt(
         "Graph query answered (retry %d): %r → %r",
         attempt, question[:60], answer[:120],
     )
+    trace_event("CYPHER_EXECUTED", "ok", f"Retry {attempt} succeeded: {answer[:80]}")
     return answer
 
 
@@ -205,6 +209,7 @@ async def execute_with_retries(
             or extract_cypher_from_error(last_error)
         )
         logger.warning("Cypher attempt 0 failed (retryable): %s", last_error[:200])
+        trace_event("CYPHER_ATTEMPT_0", "fail", last_error[:120])
 
     for attempt in range(1, MAX_CYPHER_RETRIES + 1):
         try:
@@ -218,10 +223,13 @@ async def execute_with_retries(
             # Pre-validation failure — update error and continue
             last_error = str(exc)
             logger.warning("Corrected Cypher still invalid: %s", last_error)
+            trace_event("CYPHER_CORRECTION", "fail", f"Retry {attempt} invalid: {last_error[:80]}")
         except Exception as exc:
             last_error = str(exc)
             logger.warning("Cypher retry %d failed: %s", attempt, last_error[:200])
+            trace_event("CYPHER_CORRECTION", "fail", f"Retry {attempt} error: {last_error[:80]}")
 
+    trace_event("CYPHER_ALL_FAILED", "fail", f"All {MAX_CYPHER_RETRIES + 1} attempts failed")
     raise RuntimeError(
         f"All {MAX_CYPHER_RETRIES + 1} Cypher attempts failed.  "
         f"Last error: {last_error}"
