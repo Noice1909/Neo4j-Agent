@@ -20,6 +20,7 @@ Plug-and-play:
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage
@@ -27,6 +28,9 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
+
+if TYPE_CHECKING:
+    from langgraph.graph.state import CompiledStateGraph as CompiledGraph
 
 from app.agent.state import AgentState
 from app.agent.trimming import trim_conversation

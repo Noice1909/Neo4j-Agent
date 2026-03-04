@@ -96,7 +96,7 @@ _LABELS_QUERY = "CALL db.labels() YIELD label RETURN label ORDER BY label"
 
 def _sample_query(label: str) -> str:
     """Return Cypher to fetch one node's properties for *label*."""
-    safe = re.sub(r"[^A-Za-z0-9_]", "", label)
+    safe = re.sub(r"\W", "", label)
     return f"MATCH (n:`{safe}`) RETURN properties(n) AS props LIMIT 1"
 
 
