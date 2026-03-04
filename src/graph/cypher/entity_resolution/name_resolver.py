@@ -120,11 +120,23 @@ class EntityNameResolver:
         """Extract potential entity names from the question."""
         candidates: list[str] = []
 
-        # Quoted strings: "Tom Hanks", 'The Matrix'
+        # Quoted strings: "Tom Hanks", 'The Matrix'  (highest confidence — first)
         for match in re.finditer(r"""["']([^"']+)["']""", question):
             candidates.append(match.group(1))
 
-        # Capitalised multi-word phrases (likely entity names)
+        # Single ALL-CAPS acronyms: WDIL, HK, CNAPP, CDP, CSBB
+        for match in re.finditer(r"\b([A-Z]{2,})\b", question):
+            token = match.group(1)
+            if token not in candidates:
+                candidates.append(token)
+
+        # Dot / underscore-separated identifiers: consumer_1bdb_sanitized.acd_call_frm1
+        for match in re.finditer(r"\b(\w+(?:[._]\w+)+)\b", question):
+            token = match.group(1)
+            if token not in candidates:
+                candidates.append(token)
+
+        # Capitalised multi-word phrases (likely entity names): Tom Hanks, The Matrix
         for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", question):
             phrase = match.group(1)
             if phrase not in candidates:

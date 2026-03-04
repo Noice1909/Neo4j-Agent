@@ -132,6 +132,31 @@ def _p8_where_filter(li: "LabelInfo") -> "_Example | None":
     )
 
 
+def _p9_reverse_filter(t: "RelationshipTriple", tgt: "LabelInfo") -> _Example:
+    """Filter by the target node — arrow direction stays the same as topology."""
+    sample_val = _sample(tgt)
+    return (
+        f"Which {t.source_label} nodes are connected to the "
+        f"{t.target_label} named '{sample_val}'?",
+        f"MATCH (a:{t.source_label})-[:{t.rel_type}]->"
+        f"(b:{t.target_label} {{{tgt.display_property or 'name'}: '{sample_val}'}}) RETURN a",
+    )
+
+
+def _p10_connected_via(
+    t1: "RelationshipTriple", t2: "RelationshipTriple", src: "LabelInfo",
+) -> _Example:
+    """Multi-hop 'connected to' query using a two-hop chain from topology."""
+    sample_val = _sample(src)
+    return (
+        f"Which {t2.target_label} nodes are connected to the "
+        f"{t1.source_label} named '{sample_val}'?",
+        f"MATCH (a:{t1.source_label} {{{src.display_property or 'name'}: '{sample_val}'}})"
+        f"-[:{t1.rel_type}]->(mid:{t1.target_label})"
+        f"-[:{t2.rel_type}]->(c:{t2.target_label}) RETURN c",
+    )
+
+
 # ── Collection helpers (break up complexity) ───────────────────────────────────
 
 
@@ -176,11 +201,13 @@ def _collect_chain(
 def _collect_remaining(
     labels: "list[LabelInfo]",
     triples: "list[RelationshipTriple]",
+    chains: "list[list[RelationshipTriple]]",
     label_map: "dict[str, LabelInfo]",
     examples: "list[_Example]",
     max_n: int,
 ) -> None:
-    """Patterns 5–8: undirected, property-specific, aggregation, WHERE filter."""
+    """Patterns 5–10: undirected, property-specific, aggregation, WHERE filter,
+    reverse-filter direction demo, multi-hop connected."""
     if len(labels) >= 2:
         _add_if_room(examples, _p5_undirected(labels[0]), max_n)
 
@@ -201,13 +228,27 @@ def _collect_remaining(
         )
         _add_if_room(examples, _p8_where_filter(li), max_n)
 
+    # Pattern 9 — reverse-filter: keep arrow direction, filter by target
+    if triples:
+        t = triples[0]
+        tgt = label_map.get(t.target_label)
+        if tgt:
+            _add_if_room(examples, _p9_reverse_filter(t, tgt), max_n)
+
+    # Pattern 10 — multi-hop "connected to" via chain
+    if chains and len(chains[0]) >= 2:
+        t1, t2 = chains[0][0], chains[0][1]
+        src = label_map.get(t1.source_label)
+        if src:
+            _add_if_room(examples, _p10_connected_via(t1, t2, src), max_n)
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 
 def generate_few_shot_examples(
     topology: "GraphTopology",
-    max_examples: int = 8,
+    max_examples: int = 10,
     manual_overrides: list[dict] | None = None,
 ) -> str:
     """
@@ -218,7 +259,7 @@ def generate_few_shot_examples(
     topology:
         The live graph topology to derive examples from.
     max_examples:
-        Hard cap on the number of examples (default 8).
+        Hard cap on the number of examples (default 10).
     manual_overrides:
         Optional list of dicts with ``question`` and ``cypher`` keys that are
         prepended verbatim and count against *max_examples*.
@@ -247,7 +288,7 @@ def generate_few_shot_examples(
 
     _collect_traversal(triples, label_map, examples, max_examples)
     _collect_chain(topology.chains, label_map, examples, max_examples)
-    _collect_remaining(labels, triples, label_map, examples, max_examples)
+    _collect_remaining(labels, triples, topology.chains, label_map, examples, max_examples)
 
     if not examples:
         logger.warning("dynamic_examples: topology is empty — no examples generated.")
