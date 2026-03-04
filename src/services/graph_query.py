@@ -11,7 +11,7 @@ from langchain_core.language_models import BaseChatModel
 
 from src.core.config import get_settings
 from src.core.exceptions import ReadOnlyViolationError
-from src.graph.connection import get_graph, ensure_connected
+from src.graph.connection import ensure_connected
 from src.graph.cypher.coreference import resolve_coreferences
 from src.graph.cypher.entity_resolution import resolve_entities
 from src.graph.cypher.retry import execute_with_retries

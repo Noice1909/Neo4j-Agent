@@ -62,5 +62,7 @@ def register_mcp_tool(mcp, schema_cache: SchemaCache) -> None:
             "and property keys.  Call this before formulating a graph query."
         ),
     )
-    async def _mcp_get_schema() -> str:  # noqa: F841
+    async def _mcp_get_schema() -> str:
         return await get_schema_info(schema_cache)
+
+    _ = _mcp_get_schema  # registered by @mcp.tool decorator

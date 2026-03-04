@@ -193,12 +193,14 @@ def create_app() -> FastAPI:
 
     # ── Request ID middleware (outermost — runs first) ────────────────────────
     @app.middleware("http")
-    async def request_id_middleware(request: Request, call_next) -> Response:  # noqa: F841
+    async def request_id_middleware(request: Request, call_next) -> Response:
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
         request.state.request_id = request_id
         response: Response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response
+
+    _ = request_id_middleware  # registered by @app.middleware decorator
 
     # ── API key authentication middleware ─────────────────────────────────────
     app.add_middleware(APIKeyMiddleware)

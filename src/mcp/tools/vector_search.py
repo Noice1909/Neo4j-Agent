@@ -156,8 +156,10 @@ def register_mcp_tool(mcp, llm: BaseChatModel, index_name: str = _DEFAULT_INDEX)
             "Requires a pre-configured vector index."
         ),
     )
-    async def _mcp_vector_search(query: str, k: int = _DEFAULT_K) -> str:  # noqa: F841
+    async def _mcp_vector_search(query: str, k: int = _DEFAULT_K) -> str:
         try:
             return await run_vector_search(query, llm, index_name=index_name, k=k)
         except VectorSearchUnavailableError as exc:
             return f"Vector search unavailable: {exc}"
+
+    _ = _mcp_vector_search  # registered by @mcp.tool decorator
