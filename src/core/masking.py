@@ -149,7 +149,7 @@ def install_stream_masking() -> None:
 
 
 def mask_sensitive_processor(
-    logger: Any, method_name: str, event_dict: MutableMapping[str, Any],
+    _logger: Any, _method_name: str, event_dict: MutableMapping[str, Any],
 ) -> MutableMapping[str, Any]:
     """Structlog processor: mask ``.env`` values in log events."""
     if not _sensitive_map:

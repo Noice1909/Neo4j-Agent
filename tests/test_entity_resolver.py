@@ -122,27 +122,27 @@ class TestBuildSynonymMap:
 class TestLabelResolver:
     def test_synonym_correction(self):
         resolver = LabelResolver(schema=MOCK_SCHEMA)
-        corrected, corrections = resolver.resolve("Show me all films")
+        _, corrections = resolver.resolve("Show me all films")
         assert len(corrections) == 1
         assert corrections[0].corrected == "Movie"
         assert corrections[0].layer == "label"
-        assert corrections[0].confidence == 1.0
+        assert corrections[0].confidence == pytest.approx(1.0)
 
     def test_no_correction_for_valid_label(self):
         resolver = LabelResolver(schema=MOCK_SCHEMA)
-        corrected, corrections = resolver.resolve("Show me all Movie details")
+        _, corrections = resolver.resolve("Show me all Movie details")
         assert len(corrections) == 0
 
     def test_fuzzy_match(self):
         resolver = LabelResolver(schema=MOCK_SCHEMA, fuzzy_threshold=0.6)
-        corrected, corrections = resolver.resolve("Tell me about Moive titles")
+        _, corrections = resolver.resolve("Tell me about Moive titles")
         # "Moive" should fuzzy-match to "Movie"
         has_correction = any(c.corrected == "Movie" for c in corrections)
         assert has_correction
 
     def test_sor_to_application(self):
         resolver = LabelResolver(schema=MOCK_SCHEMA)
-        corrected, corrections = resolver.resolve("What is WIDL sor?")
+        _, corrections = resolver.resolve("What is WIDL sor?")
         # "sor" should map to "Application" via default synonyms
         has_correction = any(c.corrected == "Application" for c in corrections)
         assert has_correction

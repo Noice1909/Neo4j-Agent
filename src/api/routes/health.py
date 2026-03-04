@@ -77,7 +77,7 @@ async def liveness() -> dict:
 @router.get("/ready", summary="Readiness probe.", include_in_schema=False)
 async def readiness() -> JSONResponse:
     """Returns 200 only if all external dependencies are reachable."""
-    neo4j_check, redis_check, ollama_check = await asyncio.gather(
+    neo4j_check, _, ollama_check = await asyncio.gather(
         _check_neo4j(),
         _check_redis(),
         _check_ollama(),

@@ -25,6 +25,9 @@ from app.graph.cypher.synonyms import build_synonym_map
 
 logger = logging.getLogger(__name__)
 
+# Regex to strip non-word characters from a token.
+_NON_WORD_RE = re.compile(r"[^\w]")
+
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -102,7 +105,8 @@ class LabelResolver:
         corrected_words: list[str] = []
 
         for word in words:
-            clean = re.sub(r"[^\w]", "", word).lower()
+            raw = _NON_WORD_RE.sub("", word)
+            clean = raw.lower()
             if not clean or len(clean) < 2:
                 corrected_words.append(word)
                 continue
@@ -118,7 +122,7 @@ class LabelResolver:
                         confidence=1.0,
                     ))
                     corrected_words.append(
-                        word.replace(re.sub(r"[^\w]", "", word), canonical)
+                        word.replace(raw, canonical)
                     )
                     continue
 
@@ -143,7 +147,7 @@ class LabelResolver:
                         ).ratio(),
                     ))
                     corrected_words.append(
-                        word.replace(re.sub(r"[^\w]", "", word), matched_label)
+                        word.replace(raw, matched_label)
                     )
                     continue
 
@@ -314,7 +318,7 @@ class EntityNameResolver:
         escaped = re.sub(r'([+\-&|!(){}[\]^"~*?:\\/ ])', r"\\\1", candidate)
         search_term = f"{escaped}~"
         cypher = (
-            f"CALL db.index.fulltext.queryNodes($indexName, $term) "
+            "CALL db.index.fulltext.queryNodes($indexName, $term) "
             "YIELD node, score "
             "RETURN labels(node)[0] AS label, "
             "COALESCE(node.name, node.title) AS name, score "
@@ -414,6 +418,23 @@ class EntityNameResolver:
 
     # ── Resolution orchestration ─────────────────────────────────────────
 
+    async def _try_label_scoped(
+        self,
+        query_fn: Any,
+        candidate: str,
+        labels: list[str],
+    ) -> str | None:
+        """Run *query_fn* for each label and return the first good match."""
+        loop = asyncio.get_running_loop()
+        for label in labels:
+            results = await loop.run_in_executor(
+                None, query_fn, candidate.lower(), label,
+            )
+            best = self._pick_best(results, candidate)
+            if best:
+                return best
+        return None
+
     async def _find_closest_match(
         self, candidate: str, labels: list[str],
     ) -> str | None:
@@ -422,10 +443,9 @@ class EntityNameResolver:
 
         2a (full-text) → 2b (APOC multi-signal) → 2c (APOC phonetic).
         """
-        loop = asyncio.get_running_loop()
-
         # ── 2a: Full-text index (fastest) ────────────────────────────────
         if self._has_fulltext:
+            loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(
                 None, self._fulltext_query, candidate,
             )
@@ -435,25 +455,19 @@ class EntityNameResolver:
 
         # ── 2b: APOC multi-signal (label-scoped) ────────────────────────
         if self._has_apoc and labels:
-            for label in labels:
-                results = await loop.run_in_executor(
-                    None, self._apoc_multi_signal_query,
-                    candidate.lower(), label,
-                )
-                best = self._pick_best(results, candidate)
-                if best:
-                    return best
+            best = await self._try_label_scoped(
+                self._apoc_multi_signal_query, candidate, labels,
+            )
+            if best:
+                return best
 
         # ── 2c: APOC phonetic (label-scoped) ─────────────────────────────
         if self._has_apoc and labels:
-            for label in labels:
-                results = await loop.run_in_executor(
-                    None, self._apoc_phonetic_query,
-                    candidate.lower(), label,
-                )
-                best = self._pick_best(results, candidate)
-                if best:
-                    return best
+            best = await self._try_label_scoped(
+                self._apoc_phonetic_query, candidate, labels,
+            )
+            if best:
+                return best
 
         return None
 
