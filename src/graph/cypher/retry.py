@@ -19,7 +19,7 @@ from tenacity import (
 )
 
 from src.graph.cypher.callback import CypherSafetyCallback
-from src.graph.cypher.prompts import ENHANCED_CYPHER_PROMPT
+from src.graph.cypher.prompts import UNIVERSAL_CYPHER_RULES, _FALLBACK_PROMPT
 from src.graph.cypher.safety import validate_read_only
 from src.graph.cypher.validation import pre_validate_cypher
 from src.core.exceptions import ReadOnlyViolationError
@@ -31,19 +31,29 @@ MAX_CYPHER_RETRIES = 2
 
 
 def build_correction_prompt(
-    question: str, schema: str, failed_cypher: str, error: str,
+    question: str,
+    schema: str,
+    failed_cypher: str,
+    error: str,
+    topology_section: str = "",
 ) -> str:
     """Build a prompt asking the LLM to fix a failed Cypher query."""
-    return (
+    parts = [
         "The following Cypher query was generated to answer a question but "
         "failed when executed against Neo4j.  Fix the query and return ONLY "
-        "the corrected Cypher — no explanations, no markdown fences.\n\n"
-        f"Database schema:\n{schema}\n\n"
-        f"Original question: {question}\n\n"
-        f"Failed Cypher:\n{failed_cypher}\n\n"
-        f"Error message:\n{error}\n\n"
-        "Corrected Cypher:"
-    )
+        "the corrected Cypher — no explanations, no markdown fences.",
+        f"\nDatabase schema:\n{schema}",
+    ]
+    if topology_section:
+        parts.append(f"\n{topology_section}")
+    parts += [
+        f"\nRules:\n{UNIVERSAL_CYPHER_RULES}",
+        f"\nOriginal question: {question}",
+        f"\nFailed Cypher:\n{failed_cypher}",
+        f"\nError message:\n{error}",
+        "\nCorrected Cypher:",
+    ]
+    return "\n".join(parts)
 
 
 def strip_code_fences(text: str) -> str:
@@ -94,6 +104,7 @@ async def _run_initial_chain(
     llm: BaseChatModel,
     graph: Any,
     safety_cb: CypherSafetyCallback,
+    cypher_prompt: Any = None,
 ) -> str:
     """Run the initial Cypher chain with tenacity retry for transient errors."""
     loop = asyncio.get_running_loop()
@@ -104,7 +115,7 @@ async def _run_initial_chain(
         verbose=logger.isEnabledFor(logging.DEBUG),
         return_intermediate_steps=True,
         allow_dangerous_requests=True,
-        cypher_prompt=ENHANCED_CYPHER_PROMPT,
+        cypher_prompt=cypher_prompt or _FALLBACK_PROMPT,
     )
 
     @retry(
@@ -141,6 +152,7 @@ async def _run_correction_attempt(
     last_cypher: str | None,
     last_error: str | None,
     attempt: int,
+    topology_section: str = "",
 ) -> str:
     """Run a single LLM self-correction attempt and return the answer."""
     loop = asyncio.get_running_loop()
@@ -149,6 +161,7 @@ async def _run_correction_attempt(
         schema=schema,
         failed_cypher=last_cypher or "N/A",
         error=last_error or "unknown error",
+        topology_section=topology_section,
     )
 
     resp = await loop.run_in_executor(
@@ -189,6 +202,8 @@ async def execute_with_retries(
     llm: BaseChatModel,
     graph: Any,
     schema: str,
+    cypher_prompt: Any = None,
+    topology_section: str = "",
 ) -> str:
     """Run the Cypher chain, retrying with LLM self-correction on failure."""
     safety_cb = CypherSafetyCallback()
@@ -197,7 +212,7 @@ async def execute_with_retries(
     last_cypher: str | None = None
 
     try:
-        return await _run_initial_chain(question, llm, graph, safety_cb)
+        return await _run_initial_chain(question, llm, graph, safety_cb, cypher_prompt)
     except ReadOnlyViolationError:
         raise
     except Exception as exc:
@@ -216,6 +231,7 @@ async def execute_with_retries(
             return await _run_correction_attempt(
                 question, llm, graph, schema,
                 last_cypher, last_error, attempt,
+                topology_section=topology_section,
             )
         except ReadOnlyViolationError:
             raise

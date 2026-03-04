@@ -31,6 +31,7 @@ async def llm_resolve(
     question: str,
     schema: str,
     llm: BaseChatModel,
+    topology_section: str = "",
 ) -> tuple[str, list[Correction]]:
     """
     Ask the LLM to interpret and correct the user's question given the schema.
@@ -38,18 +39,23 @@ async def llm_resolve(
     This is the expensive fallback — only used when Layers 1 & 2 fail to
     resolve any entities.
     """
-    prompt = (
+    parts = [
         "You are an entity-resolution assistant. The user asked a question "
         "that may contain typos, wrong category names, or ambiguous entity "
-        "references.\n\n"
-        f"Database schema:\n{schema}\n\n"
-        f"User question: {question}\n\n"
-        "If the question contains any entity names or category references "
+        "references.",
+        f"\nDatabase schema:\n{schema}",
+    ]
+    if topology_section:
+        parts.append(f"\n{topology_section}")
+    parts += [
+        f"\nUser question: {question}",
+        "\nIf the question contains any entity names or category references "
         "that don't exactly match the schema, rewrite the question with "
         "corrected names/labels. If everything looks correct, return the "
-        "question unchanged.\n\n"
-        "Output ONLY the corrected question — no explanations."
-    )
+        "question unchanged.",
+        "\nOutput ONLY the corrected question — no explanations.",
+    ]
+    prompt = "\n".join(parts)
 
     loop = asyncio.get_running_loop()
     response = await loop.run_in_executor(
@@ -87,11 +93,12 @@ async def _run_llm_fallback(
     current_question: str,
     schema: str,
     llm: BaseChatModel,
+    topology_section: str = "",
 ) -> tuple[str, list[Correction]]:
     """Run Layer 3 LLM entity resolution with error handling and tracing."""
     try:
         current_question, llm_corrections = await llm_resolve(
-            current_question, schema, llm,
+            current_question, schema, llm, topology_section=topology_section,
         )
         if llm_corrections:
             logger.info(
@@ -125,6 +132,8 @@ async def resolve_entities(
     synonym_overrides: str = "",
     max_candidates: int = 5,
     fulltext_index_name: str = FULLTEXT_INDEX_NAME,
+    display_properties: list[str] | None = None,
+    topology_section: str = "",
 ) -> ResolutionResult:
     """
     Run the 3-layer entity resolution pipeline.
@@ -182,6 +191,7 @@ async def resolve_entities(
             fuzzy_threshold=fuzzy_threshold,
             max_candidates=max_candidates,
             fulltext_index_name=fulltext_index_name,
+            display_properties=display_properties,
         )
         current_question, name_corrections = await name_resolver.resolve(
             current_question,
@@ -197,6 +207,7 @@ async def resolve_entities(
     if not all_corrections:
         current_question, llm_corr = await _run_llm_fallback(
             question, current_question, schema, llm,
+            topology_section=topology_section,
         )
         all_corrections.extend(llm_corr)
     else:

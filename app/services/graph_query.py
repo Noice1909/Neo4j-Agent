@@ -1,16 +1,7 @@
 """
 Graph query service — natural language → Cypher → Neo4j → answer.
 
-Applies all five production-hardening strategies:
-
-1. **Retry with error feedback** (Strategy #1)
-2. **Graceful degradation** (Strategy #2)
-3. **Few-shot examples** (Strategy #3)
-4. **Cypher syntax pre-validation** (Strategy #4)
-5. **Query decomposition / coreference resolution** (Strategy #5)
-
-This module is framework-agnostic; see ``app.mcp.tools.graph_query`` for the
-LangChain ``@tool`` wrapper and FastMCP registration.
+Applies all five production-hardening strategies.
 """
 from __future__ import annotations
 
@@ -20,9 +11,11 @@ from langchain_core.language_models import BaseChatModel
 
 from app.core.config import get_settings
 from app.core.exceptions import ReadOnlyViolationError
-from app.graph.connection import get_graph, ensure_connected
+from app.graph.connection import ensure_connected
 from app.graph.cypher.coreference import resolve_coreferences
+from app.graph.cypher.dynamic_examples import generate_few_shot_examples
 from app.graph.cypher.entity_resolution import resolve_entities
+from app.graph.cypher.prompts import build_cypher_prompt, build_topology_section
 from app.graph.cypher.retry import execute_with_retries
 from app.graph.schema_cache import SchemaCache
 from app.core.tracing import trace_event
@@ -40,17 +33,6 @@ async def run_graph_query(
     """
     Translate a natural-language question into Cypher, execute, and answer.
 
-    Parameters
-    ----------
-    question:
-        Natural-language question from the user.
-    llm:
-        The configured LLM for Cypher generation.
-    schema_cache:
-        Schema cache used to inject the DB schema into the Cypher prompt.
-    conversation_context:
-        Optional prior-conversation summary for coreference resolution.
-
     Returns
     -------
     str
@@ -59,14 +41,21 @@ async def run_graph_query(
     Raises
     ------
     ReadOnlyViolationError
-        If the generated Cypher contains write operations (security — always raised).
+        If the generated Cypher contains write operations.
     """
     # Verify Neo4j is reachable — auto-reconnects on stale/dead connections
     graph = ensure_connected()
     schema = await schema_cache.get_schema()
+    topology = await schema_cache.get_topology()
     graph.schema = schema
+
     trace_event("GRAPH_QUERY_START", "info", question[:100])
-    # ── Strategy #5: Resolve coreferences ────────────────────────────────
+
+    # Build dynamic prompt from live topology
+    few_shot = generate_few_shot_examples(topology)
+    cypher_prompt = build_cypher_prompt(topology, few_shot)
+    topology_section = build_topology_section(topology)
+
     resolved_question = await resolve_coreferences(
         question, conversation_context, llm,
     )
@@ -83,14 +72,19 @@ async def run_graph_query(
         synonym_overrides=settings.entity_synonym_overrides,
         max_candidates=settings.entity_max_candidates,
         fulltext_index_name=settings.entity_fulltext_index_name,
+        display_properties=topology.display_properties,
+        topology_section=topology_section,
     )
     resolved_question = resolution.resolved_question
 
-    # ── Strategy #2: Graceful degradation (outer safety net) ─────────────
     try:
-        return await execute_with_retries(resolved_question, llm, graph, schema)
+        return await execute_with_retries(
+            resolved_question, llm, graph, schema,
+            cypher_prompt=cypher_prompt,
+            topology_section=topology_section,
+        )
     except ReadOnlyViolationError:
-        raise  # Security: always propagate write-attempt errors
+        raise
     except Exception as exc:
         logger.error(
             "All Cypher attempts failed for %r: %s",

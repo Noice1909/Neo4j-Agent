@@ -27,6 +27,7 @@ import time
 from typing import TYPE_CHECKING
 
 from src.core.exceptions import SchemaUnavailableError
+from src.graph.topology import GraphTopology, extract_topology
 
 if TYPE_CHECKING:
     from langchain_neo4j import Neo4jGraph
@@ -55,6 +56,7 @@ class SchemaCache:
         self._ttl = ttl_seconds
         self._cached_schema: str | None = None
         self._cached_at: float = 0.0  # monotonic timestamp
+        self._cached_topology: GraphTopology | None = None
         self._refresh_task: asyncio.Task | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -79,10 +81,30 @@ class SchemaCache:
         self._schedule_proactive_refresh()
         return schema
 
+    async def get_topology(self) -> GraphTopology:
+        """
+        Return the cached ``GraphTopology``, extracting from Neo4j on first call.
+
+        The topology is refreshed on the same cycle as the schema (same TTL).
+        """
+        if self._cached_topology is not None and (
+            time.monotonic() - self._cached_at
+        ) < self._ttl:
+            return self._cached_topology
+
+        # Trigger a full refresh (schema + topology)
+        await self._fetch_and_cache()
+        if self._cached_topology is None:
+            # extract_topology failed; return empty topology so callers don't crash
+            logger.warning("Topology unavailable — returning empty topology.")
+            return GraphTopology()
+        return self._cached_topology
+
     async def invalidate(self) -> None:
-        """Clear the cached schema so the next call re-fetches from Neo4j."""
+        """Clear the cached schema and topology so the next call re-fetches from Neo4j."""
         self._cached_schema = None
         self._cached_at = 0.0
+        self._cached_topology = None
         logger.info("Schema cache invalidated.")
 
     async def stop_refresh_task(self) -> None:
@@ -119,6 +141,13 @@ class SchemaCache:
             self._ttl,
             len(schema),
         )
+
+        # Extract and cache topology on every schema refresh
+        try:
+            self._cached_topology = await extract_topology(self._graph)
+        except Exception as exc:
+            logger.warning("Topology extraction failed (non-fatal): %s", exc)
+
         return schema
 
     def _schedule_proactive_refresh(self) -> None:

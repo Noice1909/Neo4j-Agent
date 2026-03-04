@@ -55,12 +55,17 @@ class EntityNameResolver:
         fuzzy_threshold: float = 0.75,
         max_candidates: int = 5,
         fulltext_index_name: str = FULLTEXT_INDEX_NAME,
+        display_properties: list[str] | None = None,
     ) -> None:
         self._graph = graph
         self._schema = schema
         self._fuzzy_threshold = fuzzy_threshold
         self._max_candidates = max_candidates
         self._index_name = fulltext_index_name
+        # Build the COALESCE expression for name retrieval dynamically
+        props = display_properties or ["name", "title"]
+        coalesce_args = ", ".join(f"node.{p}" for p in props)
+        self._name_coalesce = f"COALESCE({coalesce_args})"
 
         # Detect capabilities once (read-only probes)
         self._has_fulltext = (
@@ -138,7 +143,7 @@ class EntityNameResolver:
             "CALL db.index.fulltext.queryNodes($indexName, $term) "
             "YIELD node, score "
             "RETURN labels(node)[0] AS label, "
-            "COALESCE(node.name, node.title) AS name, score "
+            f"{self._name_coalesce} AS name, score "
             "LIMIT $limit"
         )
         try:

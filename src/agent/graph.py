@@ -38,11 +38,55 @@ logger = logging.getLogger(__name__)
 # ── Graph builder ─────────────────────────────────────────────────────────────
 
 
+def build_system_prompt(schema_labels: list[str]) -> SystemMessage:
+    """
+    Build a domain-agnostic system prompt from live schema label names.
+
+    Parameters
+    ----------
+    schema_labels:
+        Canonical Neo4j node labels (e.g. ``["Application", "Domain", "Platform"]``).
+    """
+    if schema_labels:
+        # "Application, Domain, Platform, and more"
+        sorted_labels = sorted(schema_labels)
+        if len(sorted_labels) > 3:
+            domain_desc = (
+                ", ".join(sorted_labels[:3]) + f", and {len(sorted_labels) - 3} more"
+            )
+        else:
+            domain_desc = ", ".join(sorted_labels)
+    else:
+        domain_desc = "various entities and their relationships"
+
+    return SystemMessage(content=(
+        "You are a helpful and knowledgeable assistant. "
+        f"You can answer questions about {domain_desc}. "
+        "You have access to tools that help you find information.\n\n"
+        "CRITICAL RULES:\n"
+        "- NEVER mention databases, queries, Cypher, Neo4j, graphs, schemas, "
+        "nodes, relationships, or any technical implementation details.\n"
+        "- NEVER tell the user to 'use specific names', 'avoid pronouns', or "
+        "'rephrase for the query'. The user must not know how you find answers.\n"
+        "- If the user's question is vague or uses pronouns like 'those', 'them', "
+        "'they', you MAY ask a brief, natural clarifying question like: "
+        "'Could you specify which one you mean?' — but NEVER explain WHY you need "
+        "clarification in technical terms.\n"
+        "- When you have enough context, use your tools and respond with a "
+        "direct, conversational answer.\n"
+        "- If something goes wrong internally, just say you couldn't find the "
+        "information — never expose error details or suggest query formatting.\n"
+        "- The system may automatically correct minor typos or alternate names "
+        "in the user's question. Trust and use the corrected form when querying."
+    ))
+
+
 def build_agent_graph(
     llm: BaseChatModel,
     tools: list[BaseTool],
     checkpointer: BaseCheckpointSaver,
     *,
+    schema_labels: list[str] | None = None,
     max_conversation_tokens: int = 100_000,
     token_budget_reserve: int = 4096,
 ) -> "CompiledGraph":  # type: ignore[name-defined]
@@ -75,28 +119,8 @@ def build_agent_graph(
     model_with_tools = llm.bind_tools(tools)
     effective_budget = max(max_conversation_tokens - token_budget_reserve, 1024)
 
-    # System prompt: hide all implementation details from the user
-    _SYSTEM_PROMPT = SystemMessage(content=(
-        "You are a helpful and knowledgeable assistant. "
-        "You can answer questions about movies, actors, directors, and their "
-        "relationships. You have access to tools that help you find information.\n\n"
-        "CRITICAL RULES:\n"
-        "- NEVER mention databases, queries, Cypher, Neo4j, graphs, schemas, "
-        "nodes, relationships, or any technical implementation details.\n"
-        "- NEVER tell the user to 'use specific names', 'avoid pronouns', or "
-        "'rephrase for the query'. The user must not know how you find answers.\n"
-        "- If the user's question is vague or uses pronouns like 'those', 'them', "
-        "'they', you MAY ask a brief, natural clarifying question like: "
-        "'Which movies do you mean?' or 'Could you tell me which ones you're "
-        "referring to?' — but NEVER explain WHY you need clarification in "
-        "technical terms.\n"
-        "- When you have enough context, use your tools and respond with a "
-        "direct, conversational answer.\n"
-        "- If something goes wrong internally, just say you couldn't find the "
-        "information — never expose error details or suggest query formatting.\n"
-        "- The system may automatically correct minor typos or alternate names "
-        "in the user's question. Trust and use the corrected form when querying."
-    ))
+    # System prompt: built dynamically from live schema labels
+    _SYSTEM_PROMPT = build_system_prompt(schema_labels or [])
 
     # ── Nodes ─────────────────────────────────────────────────────────────────────────
 

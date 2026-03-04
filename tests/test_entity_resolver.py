@@ -11,7 +11,6 @@ import pytest
 from src.graph.cypher.synonyms import (
     auto_generate_synonyms,
     build_synonym_map,
-    DEFAULT_SYNONYMS,
 )
 from src.graph.cypher.entity_resolution import (
     Correction,

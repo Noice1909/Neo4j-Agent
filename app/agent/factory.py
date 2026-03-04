@@ -31,6 +31,7 @@ def init_agent(
     tools: list,
     checkpointer: BaseCheckpointSaver,
     *,
+    schema_labels: list[str] | None = None,
     max_conversation_tokens: int = 100_000,
     token_budget_reserve: int = 4096,
 ) -> None:
@@ -48,6 +49,9 @@ def init_agent(
         List of LangChain `BaseTool` instances to bind to the agent.
     checkpointer:
         An initialised `BaseCheckpointSaver` (e.g. `AsyncRedisSaver`).
+    schema_labels:
+        Canonical Neo4j node labels from the live schema (used to build the
+        domain-aware system prompt).
     max_conversation_tokens:
         Maximum token budget for conversation history.
     token_budget_reserve:
@@ -59,6 +63,7 @@ def init_agent(
         llm,
         tools,
         checkpointer,
+        schema_labels=schema_labels,
         max_conversation_tokens=max_conversation_tokens,
         token_budget_reserve=token_budget_reserve,
     )

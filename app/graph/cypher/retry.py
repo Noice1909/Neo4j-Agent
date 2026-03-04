@@ -1,10 +1,5 @@
 """
 Cypher retry engine with LLM self-correction (Strategy #1).
-
-Orchestrates:
-  - Attempt 0: Normal ``GraphCypherQAChain`` invocation with few-shot prompt
-  - Attempts 1‥N: Feed the error back to the LLM for self-correction
-  - Transient-error retry via ``tenacity`` (network / timeout)
 """
 from __future__ import annotations
 
@@ -24,7 +19,7 @@ from tenacity import (
 )
 
 from app.graph.cypher.callback import CypherSafetyCallback
-from app.graph.cypher.prompts import ENHANCED_CYPHER_PROMPT
+from app.graph.cypher.prompts import UNIVERSAL_CYPHER_RULES, _FALLBACK_PROMPT
 from app.graph.cypher.safety import validate_read_only
 from app.graph.cypher.validation import pre_validate_cypher
 from app.core.exceptions import ReadOnlyViolationError
@@ -32,26 +27,33 @@ from app.core.tracing import trace_event
 
 logger = logging.getLogger(__name__)
 
-MAX_CYPHER_RETRIES = 2  # additional self-correction attempts after first failure
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+MAX_CYPHER_RETRIES = 2
 
 
 def build_correction_prompt(
-    question: str, schema: str, failed_cypher: str, error: str,
+    question: str,
+    schema: str,
+    failed_cypher: str,
+    error: str,
+    topology_section: str = "",
 ) -> str:
     """Build a prompt asking the LLM to fix a failed Cypher query."""
-    return (
+    parts = [
         "The following Cypher query was generated to answer a question but "
         "failed when executed against Neo4j.  Fix the query and return ONLY "
-        "the corrected Cypher — no explanations, no markdown fences.\n\n"
-        f"Database schema:\n{schema}\n\n"
-        f"Original question: {question}\n\n"
-        f"Failed Cypher:\n{failed_cypher}\n\n"
-        f"Error message:\n{error}\n\n"
-        "Corrected Cypher:"
-    )
+        "the corrected Cypher — no explanations, no markdown fences.",
+        f"\nDatabase schema:\n{schema}",
+    ]
+    if topology_section:
+        parts.append(f"\n{topology_section}")
+    parts += [
+        f"\nRules:\n{UNIVERSAL_CYPHER_RULES}",
+        f"\nOriginal question: {question}",
+        f"\nFailed Cypher:\n{failed_cypher}",
+        f"\nError message:\n{error}",
+        "\nCorrected Cypher:",
+    ]
+    return "\n".join(parts)
 
 
 def strip_code_fences(text: str) -> str:
@@ -59,9 +61,9 @@ def strip_code_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
-        lines = lines[1:]  # drop opening fence
+        lines = lines[1:]
         if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]  # drop closing fence
+            lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
 
@@ -88,8 +90,8 @@ def is_cypher_error(exc: Exception) -> bool:
 def extract_cypher_from_error(error_msg: str) -> str | None:
     """Best-effort extraction of the failed Cypher from a Neo4j error."""
     for pat in [
-        r"Generated Cypher:\n(.+?)(?:\n\n|\nFull)",   # LangChain format
-        r"(?:Invalid input|Syntax error).*?'(.+?)'",  # neo4j driver format
+        r"Generated Cypher:\n(.+?)(?:\n\n|\nFull)",
+        r"(?:Invalid input|Syntax error).*?'(.+?)'",
     ]:
         m = re.search(pat, error_msg, re.DOTALL | re.IGNORECASE)
         if m:
@@ -97,14 +99,12 @@ def extract_cypher_from_error(error_msg: str) -> str | None:
     return None
 
 
-# ── Retry engine ──────────────────────────────────────────────────────────────
-
-
 async def _run_initial_chain(
     question: str,
     llm: BaseChatModel,
     graph: Any,
     safety_cb: CypherSafetyCallback,
+    cypher_prompt: Any = None,
 ) -> str:
     """Run the initial Cypher chain with tenacity retry for transient errors."""
     loop = asyncio.get_running_loop()
@@ -115,7 +115,7 @@ async def _run_initial_chain(
         verbose=logger.isEnabledFor(logging.DEBUG),
         return_intermediate_steps=True,
         allow_dangerous_requests=True,
-        cypher_prompt=ENHANCED_CYPHER_PROMPT,
+        cypher_prompt=cypher_prompt or _FALLBACK_PROMPT,
     )
 
     @retry(
@@ -152,6 +152,7 @@ async def _run_correction_attempt(
     last_cypher: str | None,
     last_error: str | None,
     attempt: int,
+    topology_section: str = "",
 ) -> str:
     """Run a single LLM self-correction attempt and return the answer."""
     loop = asyncio.get_running_loop()
@@ -160,6 +161,7 @@ async def _run_correction_attempt(
         schema=schema,
         failed_cypher=last_cypher or "N/A",
         error=last_error or "unknown error",
+        topology_section=topology_section,
     )
 
     resp = await loop.run_in_executor(
@@ -200,6 +202,8 @@ async def execute_with_retries(
     llm: BaseChatModel,
     graph: Any,
     schema: str,
+    cypher_prompt: Any = None,
+    topology_section: str = "",
 ) -> str:
     """Run the Cypher chain, retrying with LLM self-correction on failure."""
     safety_cb = CypherSafetyCallback()
@@ -208,7 +212,7 @@ async def execute_with_retries(
     last_cypher: str | None = None
 
     try:
-        return await _run_initial_chain(question, llm, graph, safety_cb)
+        return await _run_initial_chain(question, llm, graph, safety_cb, cypher_prompt)
     except ReadOnlyViolationError:
         raise
     except Exception as exc:
@@ -227,10 +231,12 @@ async def execute_with_retries(
             return await _run_correction_attempt(
                 question, llm, graph, schema,
                 last_cypher, last_error, attempt,
+                topology_section=topology_section,
             )
         except ReadOnlyViolationError:
             raise
         except ValueError as exc:
+            # Pre-validation failure — update error and continue
             last_error = str(exc)
             logger.warning("Corrected Cypher still invalid: %s", last_error)
             trace_event("CYPHER_CORRECTION", "fail", f"Retry {attempt} invalid: {last_error[:80]}")

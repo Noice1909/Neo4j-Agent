@@ -55,6 +55,8 @@ from app.core.exception_handlers import (
     vector_search_unavailable_handler,
 )
 from app.graph.connection import close_graph, init_graph
+from app.graph.cypher.coreference import build_coreference_regex, set_coreference_regex
+from app.graph.cypher.synonyms import llm_generate_synonyms
 from app.graph.schema_cache import SchemaCache
 from app.llm.factory import get_llm_from_settings
 from app.mcp.server import mcp, register_all_tools
@@ -107,6 +109,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     await schema_cache.warm_up()
     set_schema_cache_instance(schema_cache)
+
+    # ── 2b. Extract graph topology (cached inside schema_cache) ───────────────
+    logger.info("[2b] Extracting graph topology...")
+    topology = await schema_cache.get_topology()
+    logger.info(
+        "Topology ready: %d labels, %d triples.",
+        len(topology.labels), len(topology.triples),
+    )
+
+    # ── 2c. Build dynamic coreference regex from schema labels ────────────────
+    set_coreference_regex(build_coreference_regex(topology.label_names))
+    logger.info("Coreference regex updated for %d labels.", len(topology.label_names))
 
     # ── 3. LangGraph checkpointer (Redis) ─────────────────────────────────────
     logger.info("[3/8] Initialising LangGraph checkpointer...")
@@ -168,12 +182,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         build_vector_search_tool(llm),
     ]
 
+    # ── 5b. LLM-powered synonym enrichment (needs LLM — runs after step 5) ───
+    logger.info("[5b] Generating LLM synonym enrichment...")
+    import json as _json
+    llm_synonyms = await llm_generate_synonyms(topology.label_names, llm)
+    if llm_synonyms:
+        merged = _json.loads(settings.entity_synonym_overrides or "{}")
+        merged.update(llm_synonyms)
+        settings.entity_synonym_overrides = _json.dumps(merged)
+        logger.info("LLM synonyms merged: %d aliases.", len(llm_synonyms))
+
     # ── 6. Compile LangGraph agent ────────────────────────────────────────────
     logger.info("[6/8] Compiling LangGraph agent...")
     from app.agent.checkpointer import get_checkpointer
-    init_agent(llm=llm, tools=tools, checkpointer=get_checkpointer(),
-               max_conversation_tokens=settings.max_conversation_tokens,
-               token_budget_reserve=settings.token_budget_reserve)
+    init_agent(
+        llm=llm,
+        tools=tools,
+        checkpointer=get_checkpointer(),
+        schema_labels=topology.label_names,
+        max_conversation_tokens=settings.max_conversation_tokens,
+        token_budget_reserve=settings.token_budget_reserve,
+    )
 
     # ── 7. Register FastMCP tools ─────────────────────────────────────────────
     logger.info("[7/8] Registering FastMCP tools...")
