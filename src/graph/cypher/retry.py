@@ -21,7 +21,7 @@ from tenacity import (
 from src.graph.cypher.callback import CypherSafetyCallback
 from src.graph.cypher.prompts import UNIVERSAL_CYPHER_RULES, _FALLBACK_PROMPT
 from src.graph.cypher.safety import validate_read_only
-from src.graph.cypher.validation import pre_validate_cypher
+from src.graph.cypher.validation import pre_validate_cypher, validate_relationship_types
 from src.core.exceptions import ReadOnlyViolationError
 from src.core.tracing import trace_event
 
@@ -153,6 +153,7 @@ async def _run_correction_attempt(
     last_error: str | None,
     attempt: int,
     topology_section: str = "",
+    valid_rel_types: set[str] | None = None,
 ) -> str:
     """Run a single LLM self-correction attempt and return the answer."""
     loop = asyncio.get_running_loop()
@@ -175,6 +176,14 @@ async def _run_correction_attempt(
     issues = pre_validate_cypher(corrected_cypher)
     if issues:
         raise ValueError(f"Pre-validation: {', '.join(issues)}")
+
+    if valid_rel_types:
+        invalid = validate_relationship_types(corrected_cypher, valid_rel_types)
+        if invalid:
+            raise ValueError(
+                f"Unknown relationship type(s): {', '.join(invalid)}. "
+                f"Valid types: {', '.join(sorted(valid_rel_types))}"
+            )
 
     raw = await loop.run_in_executor(
         None, lambda cc=corrected_cypher: graph.query(cc),
@@ -204,9 +213,10 @@ async def execute_with_retries(
     schema: str,
     cypher_prompt: Any = None,
     topology_section: str = "",
+    valid_rel_types: set[str] | None = None,
 ) -> str:
     """Run the Cypher chain, retrying with LLM self-correction on failure."""
-    safety_cb = CypherSafetyCallback()
+    safety_cb = CypherSafetyCallback(valid_rel_types=valid_rel_types)
 
     last_error: str | None = None
     last_cypher: str | None = None
@@ -232,6 +242,7 @@ async def execute_with_retries(
                 question, llm, graph, schema,
                 last_cypher, last_error, attempt,
                 topology_section=topology_section,
+                valid_rel_types=valid_rel_types,
             )
         except ReadOnlyViolationError:
             raise

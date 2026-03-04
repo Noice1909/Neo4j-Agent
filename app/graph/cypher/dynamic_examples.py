@@ -248,8 +248,9 @@ def _collect_remaining(
 
 def generate_few_shot_examples(
     topology: "GraphTopology",
-    max_examples: int = 10,
+    max_examples: int = 15,
     manual_overrides: list[dict] | None = None,
+    question: str | None = None,
 ) -> str:
     """
     Build a few-shot block from *topology*.
@@ -259,10 +260,13 @@ def generate_few_shot_examples(
     topology:
         The live graph topology to derive examples from.
     max_examples:
-        Hard cap on the number of examples (default 10).
+        Hard cap on the number of examples (default 15).
     manual_overrides:
         Optional list of dicts with ``question`` and ``cypher`` keys that are
         prepended verbatim and count against *max_examples*.
+    question:
+        Optional user question; when provided, triples whose source/target
+        label appears in the question are prioritised first.
 
     Returns
     -------
@@ -280,7 +284,18 @@ def generate_few_shot_examples(
                 examples.append((q, c))
 
     labels = topology.labels
+
+    # Prioritise triples whose labels appear in the question
     triples = topology.triples
+    if question:
+        q_lower = question.lower()
+        relevant = [
+            t for t in triples
+            if t.source_label.lower() in q_lower or t.target_label.lower() in q_lower
+        ]
+        rest = [t for t in triples if t not in relevant]
+        triples = relevant + rest
+
     label_map: dict[str, LabelInfo] = {li.label: li for li in labels}  # type: ignore[type-arg]
 
     if labels:
@@ -295,9 +310,9 @@ def generate_few_shot_examples(
         return ""
 
     lines: list[str] = []
-    for i, (question, cypher) in enumerate(examples[:max_examples], start=1):
+    for i, (q, cypher) in enumerate(examples[:max_examples], start=1):
         lines.append(f"Example {i}:")
-        lines.append(f"  Question: {question}")
+        lines.append(f"  Question: {q}")
         lines.append(f"  Cypher:   {cypher}")
         lines.append("")
 

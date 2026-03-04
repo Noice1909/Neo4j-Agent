@@ -51,49 +51,76 @@ def _render_chain(chain: "list[RelationshipTriple]") -> str:
     return "".join(parts)
 
 
-def build_topology_section(topology: "GraphTopology") -> str:
+def _triple_lines(topology: "GraphTopology") -> list[str]:
+    """Render the per-triple block with counts and filter-by-target examples."""
+    lines: list[str] = ["Relationship topology (use ONLY these types):"]
+    for t in topology.triples:
+        bidi = " ↔ (bidirectional)" if t.bidirectional else ""
+        count_note = f" [{t.count:,} relationships]" if t.count > 0 else ""
+        lines.append(
+            f"  ({t.source_label})-[:{t.rel_type}]->({t.target_label}){bidi}{count_note}"
+        )
+        lines.append(
+            f"    filter by {t.target_label}: "
+            f"MATCH (a:{t.source_label})-[:{t.rel_type}]->"
+            f"(b:{t.target_label} {{name:'X'}}) RETURN a"
+        )
+    return lines
+
+
+def _chain_lines(topology: "GraphTopology") -> list[str]:
+    """Render the multi-hop chain paths block (empty list if none)."""
+    if not topology.chains:
+        return []
+    lines = ["", "Multi-hop traversal paths (for 'connected to' / indirect queries):"]
+    for chain in topology.chains:
+        rendered = _render_chain(chain)
+        if rendered:
+            lines.append(f"  {rendered}")
+    return lines
+
+
+def _prop_lines(topology: "GraphTopology") -> list[str]:
+    """Render the per-label property hints block (empty list if none)."""
+    entries = [
+        f"  {li.label}: {', '.join(li.properties[:8])}"
+        for li in topology.labels
+        if len(li.properties) > 1
+    ]
+    if not entries:
+        return []
+    return [
+        "",
+        "Node properties (use n.PropertyName in RETURN for property-specific queries):",
+        *entries,
+    ]
+
+
+def build_topology_section(
+    topology: "GraphTopology",
+    full_valid_types: "set[str] | None" = None,
+) -> str:
     """
     Render *topology* as an enriched block including:
 
-    - Per-triple ``(Source)-[:REL]->(Target)`` with a filter-by-target example
+    - Per-triple ``(Source)-[:REL]->(Target)`` with count, bidirectionality,
+      and a filter-by-target example
     - Multi-hop chain paths (for "connected to" / indirect queries)
     - Per-label property hints (for property-specific RETURN queries)
+    - Optional note listing all valid relationship types when a filtered
+      topology is in use
 
     Returns an empty string when the topology has no triples.
     """
     if not topology.triples:
         return ""
 
-    lines: list[str] = ["Relationship topology (use ONLY these types):"]
-    for t in topology.triples:
-        lines.append(f"  {t}")
-        lines.append(
-            f"    filter by {t.target_label}: "
-            f"MATCH (a:{t.source_label})-[:{t.rel_type}]->"
-            f"(b:{t.target_label} {{name:'X'}}) RETURN a"
-        )
+    lines = _triple_lines(topology)
+    lines += _chain_lines(topology)
+    lines += _prop_lines(topology)
 
-    # Multi-hop chain paths
-    if topology.chains:
-        lines.append("")
-        lines.append("Multi-hop traversal paths (for 'connected to' / indirect queries):")
-        for chain in topology.chains:
-            rendered = _render_chain(chain)
-            if rendered:
-                lines.append(f"  {rendered}")
-
-    # Per-label property hints
-    prop_lines: list[str] = []
-    for li in topology.labels:
-        if len(li.properties) > 1:
-            prop_list = ", ".join(li.properties[:8])  # cap at 8 for prompt brevity
-            prop_lines.append(f"  {li.label}: {prop_list}")
-    if prop_lines:
-        lines.append("")
-        lines.append(
-            "Node properties (use n.PropertyName in RETURN for property-specific queries):"
-        )
-        lines.extend(prop_lines)
+    if full_valid_types and full_valid_types != topology.valid_rel_types:
+        lines += ["", f"All valid relationship types: {', '.join(sorted(full_valid_types))}"]
 
     return "\n".join(lines)
 

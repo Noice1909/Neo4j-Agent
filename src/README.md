@@ -43,12 +43,13 @@ src/
 │   ├── schema_cache.py            # In-memory schema + topology cache with TTL
 │   └── cypher/
 │       ├── safety.py              # Read-only Cypher validation
-│       ├── validation.py          # Query structure validation
+│       ├── validation.py          # Query structure + relationship-type validation
 │       ├── prompts.py             # Dynamic Cypher prompt builder (topology-aware)
 │       ├── dynamic_examples.py    # Auto-generated few-shot examples from live topology
+│       ├── topology_filter.py     # Query-aware topology subsetting (Strategy #6)
 │       ├── retry.py               # Tenacity retry + topology-enriched self-correction
 │       ├── coreference.py         # Pronoun/coreference resolution (dynamic regex)
-│       ├── callback.py            # CypherSafetyCallback for LangChain
+│       ├── callback.py            # CypherSafetyCallback (safety + rel-type validation)
 │       ├── synonyms.py            # Auto-generated synonyms (pattern + LLM enrichment)
 │       └── entity_resolution/     # 3-layer entity resolution pipeline
 │           ├── models.py          # Correction / ResolutionResult data classes
@@ -74,7 +75,7 @@ src/
 | **LangGraph** | Stateful agent with tool-calling loop, context window trimming, and SQLite checkpoints |
 | **LangChain** | `GraphCypherQAChain` for natural language → Cypher → answer |
 | **Neo4j** | Any knowledge graph database — domain detected automatically from live schema |
-| **GraphTopology** | Live-extracted labels, relationship triples, and multi-hop chains; drives all dynamic components |
+| **GraphTopology** | Live-extracted labels, relationship triples (with APOC counts + bidirectionality), and multi-hop chains; drives all dynamic components |
 | **SQLite** | Session persistence (checkpointer) — zero-config, file-based |
 | **Ollama** | Local LLM inference (default: `qwen2.5:latest`) |
 | **Query Dedup** | Two-layer deduplication: response cache + in-flight coalescing |
@@ -103,7 +104,8 @@ The application derives all domain-specific configuration from the live Neo4j sc
 [2b] Topology extraction → GraphTopology built from live Neo4j
       • Node labels + properties + sample values
       • (A)-[:REL]->(B) relationship triples
-      • Multi-hop chains (DFS, max depth 3)
+      • APOC meta enrichment: relationship counts + bidirectionality (graceful fallback)
+      • Multi-hop chains (DFS, max depth 5, max 40 chains)
 [2c] Dynamic coreference regex built from schema labels
       e.g. "that application|domain|platform|..." replaces hardcoded movie/actor
 [3]  LangGraph checkpointer (SQLite)
@@ -138,10 +140,14 @@ Client → FastAPI → APIKeyMiddleware → RateLimiter
         → Layer 2b: APOC multi-signal (Levenshtein + Sørensen-Dice + Jaro-Winkler)
         → Layer 2c: APOC phonetic (doubleMetaphone)
         → Layer 3: LLM fallback + topology context (only if no corrections found)
-      → Dynamic Cypher Prompt built from topology
-          • Topology section: (A)-[:REL]->(B) triples
-          • Auto-generated few-shot examples (8 canonical patterns)
-          • Universal Cypher rules (domain-agnostic)
+      → Query-Aware Topology Filter (topology_filter.py)
+          Narrows full topology to labels mentioned in question + one-hop neighbours
+          Falls back to full topology if no labels matched
+      → Dynamic Cypher Prompt built from filtered topology
+          • Topology section: filtered triples with counts, ↔ bidirectionality, filter-by-target hints
+          • Multi-hop chain paths, per-label property hints, full valid-types footer
+          • Auto-generated few-shot examples (up to 15 patterns, question-relevant triples first)
+          • Universal Cypher rules + relationship-type validation (blocks hallucinated rel-types)
       → LangGraph agent
         → Context Window Trimming (token-budget sliding window)
           → Pin: system prompt (domain labels) + first human message
@@ -406,7 +412,9 @@ curl http://localhost:8001/health/ready
 - **Domain-agnostic** — Works with any Neo4j database; all prompts, synonyms, coreference patterns, and examples derived dynamically from the live schema at startup
 - **No Redis required** — SQLite checkpointer + in-memory caches for simpler deployment
 - **Dynamic topology extraction** — Labels, relationship triples, and multi-hop chains extracted from live Neo4j; cached with the same TTL as the schema
-- **Auto-generated Cypher prompts** — 8 canonical Cypher patterns auto-built from topology with real sample values; topology triples injected into every prompt
+- **Query-aware topology filtering** — Narrows full schema to labels mentioned in the question + one-hop neighbours before building the Cypher prompt; reduces noise and keeps the LLM focused
+- **Auto-generated Cypher prompts** — Up to 15 few-shot patterns auto-built from filtered topology with real sample values; question-relevant triples prioritised; relationship-type validation blocks hallucinated types
+- **APOC meta enrichment** — Relationship counts and bidirectionality annotations added to topology at startup; graceful fallback if APOC is unavailable
 - **LLM synonym enrichment** — 3-5 natural aliases per label generated by the LLM at startup; merged with pattern-based synonyms and env-var overrides
 - **Context window management** — Token-based sliding window trims history before each LLM call; pins system prompt + topic anchor; configurable budget via env vars
 - **Query deduplication** — Two-layer dedup reduces redundant LLM calls (response cache + in-flight coalescing)

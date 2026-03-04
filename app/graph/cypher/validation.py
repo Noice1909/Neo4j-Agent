@@ -37,3 +37,13 @@ def pre_validate_cypher(cypher: str) -> list[str]:
         issues.append("SQL SELECT detected — expected Cypher")
 
     return issues
+
+
+def validate_relationship_types(cypher: str, valid_types: set[str]) -> list[str]:
+    """
+    Return relationship types used in *cypher* that are not in *valid_types*.
+
+    Returns an empty list when all types are valid.
+    """
+    used = set(re.findall(r"\[:(\w+)\]", cypher))
+    return sorted(used - valid_types)

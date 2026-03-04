@@ -37,6 +37,8 @@ class RelationshipTriple:
     source_label: str
     rel_type: str
     target_label: str
+    count: int = 0          # relationship instance count from apoc.meta.schema()
+    bidirectional: bool = False  # True if the same rel_type exists in both directions
 
     def __str__(self) -> str:  # noqa: D105
         return f"(:{self.source_label})-[:{self.rel_type}]->(:{self.target_label})"
@@ -64,6 +66,20 @@ class GraphTopology:
     def label_names(self) -> list[str]:
         """Sorted list of all node label strings."""
         return sorted(li.label for li in self.labels)
+
+    @property
+    def valid_rel_types(self) -> set[str]:
+        """Set of all relationship type strings present in the topology."""
+        return {t.rel_type for t in self.triples}
+
+    @property
+    def adjacency(self) -> dict[str, set[str]]:
+        """label → set of directly connected labels (one hop, either direction)."""
+        adj: dict[str, set[str]] = {}
+        for t in self.triples:
+            adj.setdefault(t.source_label, set()).add(t.target_label)
+            adj.setdefault(t.target_label, set()).add(t.source_label)
+        return adj
 
     @property
     def display_properties(self) -> list[str]:
@@ -113,8 +129,8 @@ def _detect_display_property(props: list[str]) -> str | None:
 
 def _find_chains(
     triples: list[RelationshipTriple],
-    max_depth: int = 3,
-    max_chains: int = 20,
+    max_depth: int = 5,
+    max_chains: int = 40,
 ) -> list[list[RelationshipTriple]]:
     """
     Find multi-hop paths up to *max_depth* hops via depth-first search.
@@ -155,6 +171,44 @@ def _find_chains(
     return chains
 
 
+# ── APOC meta helper ─────────────────────────────────────────────────────────
+
+def _parse_apoc_meta(
+    meta: dict,
+) -> dict[tuple[str, str, str], dict]:
+    """
+    Parse ``apoc.meta.schema()`` output into a lookup keyed by
+    ``(source_label, rel_type, target_label)`` with ``{"count": int}`` values.
+    """
+    result: dict[tuple[str, str, str], dict] = {}
+    for src_label, label_data in meta.items():
+        if not isinstance(label_data, dict):
+            continue
+        for rel_type, rel_data in label_data.get("relationships", {}).items():
+            if not isinstance(rel_data, dict):
+                continue
+            count = int(rel_data.get("count", 0))
+            for tgt_label in rel_data.get("labels", []):
+                result[(src_label, rel_type, str(tgt_label))] = {"count": count}
+    return result
+
+
+def _enrich_triples(
+    triples: list[RelationshipTriple],
+    apoc_map: dict[tuple[str, str, str], dict],
+) -> list[RelationshipTriple]:
+    """Rebuild *triples* with APOC-derived count and bidirectionality flags."""
+    reverse_set = {(t.target_label, t.rel_type, t.source_label) for t in triples}
+    return [
+        RelationshipTriple(
+            t.source_label, t.rel_type, t.target_label,
+            count=apoc_map.get((t.source_label, t.rel_type, t.target_label), {}).get("count", 0),
+            bidirectional=(t.target_label, t.rel_type, t.source_label) in reverse_set,
+        )
+        for t in triples
+    ]
+
+
 # ── Main extraction function ──────────────────────────────────────────────────
 
 async def extract_topology(graph: "Neo4jGraph") -> GraphTopology:
@@ -184,6 +238,19 @@ async def extract_topology(graph: "Neo4jGraph") -> GraphTopology:
     except Exception as exc:
         logger.warning("Topology: relationship triple query failed: %s", exc)
         triples = []
+
+    # ── 1b. Optional APOC enrichment (counts + bidirectionality) ──────────────
+    if triples:
+        try:
+            apoc_rows = await loop.run_in_executor(
+                None, graph.query, "CALL apoc.meta.schema() YIELD value RETURN value",
+            )
+            if apoc_rows and apoc_rows[0].get("value"):
+                apoc_map = _parse_apoc_meta(apoc_rows[0]["value"])
+                triples = _enrich_triples(triples, apoc_map)
+                logger.info("Topology: APOC meta enrichment complete.")
+        except Exception:
+            logger.debug("APOC meta.schema() unavailable — using unenriched triples.")
 
     # ── 2. Node labels ─────────────────────────────────────────────────────────
     label_names: list[str] = []
