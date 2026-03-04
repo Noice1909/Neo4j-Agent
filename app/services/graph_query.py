@@ -20,7 +20,7 @@ from langchain_core.language_models import BaseChatModel
 
 from app.core.config import get_settings
 from app.core.exceptions import ReadOnlyViolationError
-from app.graph.connection import get_graph
+from app.graph.connection import get_graph, ensure_connected
 from app.graph.cypher.coreference import resolve_coreferences
 from app.graph.cypher.entity_resolver import resolve_entities
 from app.graph.cypher.retry import execute_with_retries
@@ -60,7 +60,8 @@ async def run_graph_query(
     ReadOnlyViolationError
         If the generated Cypher contains write operations (security — always raised).
     """
-    graph = get_graph()
+    # Verify Neo4j is reachable — auto-reconnects on stale/dead connections
+    graph = ensure_connected()
     schema = await schema_cache.get_schema()
     graph.schema = schema
 

@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # When True, rewrite neo4j+s:// → neo4j+ssc:// (skip TLS cert verification).
     # Only enable for managed cloud instances (AuraDB) where cert chain fails.
     neo4j_skip_tls_verify: bool = False
+    # Connection resilience — retry during startup & auto-reconnect at runtime.
+    neo4j_startup_max_retries: int = 5       # How many times to retry init_graph() at startup
+    neo4j_startup_retry_delay: float = 3.0   # Seconds between startup retries (exponential)
 
     # ── Ollama ───────────────────────────────────────────────────────────────
     ollama_base_url: str = "http://localhost:11434"

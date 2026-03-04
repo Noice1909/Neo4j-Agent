@@ -1,17 +1,23 @@
 """
-Neo4j graph connection management.
+Neo4j graph connection management with production resilience.
 
-Provides a module-level singleton `Neo4jGraph` instance initialised from
-`Settings`.  The graph is accessed through `get_graph()` which is also
-registered as a FastAPI dependency in `app/deps.py`.
+Features:
+  • Startup retry loop — keeps retrying until Neo4j is reachable
+  • ``ensure_connected()`` — verifies the driver is alive before each query;
+    auto-reconnects when a stale / dead connection is detected
+  • ``reconnect_graph()`` — tears down the old singleton and creates a fresh one
 
-The Neo4j user configured via `NEO4J_USER` / `NEO4J_PASSWORD` **must** be a
-read-only account (see README for DDL commands).  The `CypherSafetyValidator`
-in `app/graph/cypher_safety.py` acts as an additional defence-in-depth layer.
+The ``Neo4jGraph`` singleton is accessed via ``get_graph()`` and is also
+registered as a FastAPI dependency.
+
+The Neo4j user configured via ``NEO4J_USER`` / ``NEO4J_PASSWORD`` **must** be a
+read-only account (see README for DDL commands).  The ``CypherSafetyValidator``
+in ``app/graph/cypher_safety.py`` acts as an additional defence-in-depth layer.
 """
 from __future__ import annotations
 
 import logging
+import time
 
 from langchain_neo4j import Neo4jGraph
 
@@ -21,33 +27,14 @@ logger = logging.getLogger(__name__)
 
 # Module-level singleton — set during app lifespan startup.
 _graph: Neo4jGraph | None = None
+# Keep a reference to the settings used for reconnection.
+_settings: Settings | None = None
 
 
-def init_graph(settings: Settings) -> Neo4jGraph:
-    """
-    Create and cache a `Neo4jGraph` singleton.
+# ── URI helper ────────────────────────────────────────────────────────────────
 
-    Parameters
-    ----------
-    settings:
-        Application settings (injected from `get_settings()`).
-
-    Returns
-    -------
-    Neo4jGraph
-        A connected, schema-aware Neo4j graph instance.
-    """
-    global _graph
-    if _graph is not None:
-        return _graph
-
-    logger.info("Initialising Neo4j connection to %s", settings.neo4j_uri)
-
-    # AuraDB (neo4j+s://) uses TLS but the certificate chain can fail Python's
-    # SSL verification in some environments.  neo4j+ssc:// keeps full TLS
-    # encryption while skipping the certificate chain check.
-    # This rewrite is OPT-IN via NEO4J_SKIP_TLS_VERIFY=true to avoid silently
-    # downgrading security in production self-hosted deployments.
+def _resolve_uri(settings: Settings) -> str:
+    """Apply optional TLS-verification rewrite and return the final URI."""
     uri = settings.neo4j_uri
     if settings.neo4j_skip_tls_verify:
         if uri.startswith("neo4j+s://"):
@@ -69,8 +56,13 @@ def init_graph(settings: Settings) -> Neo4jGraph:
                 "Set NEO4J_SKIP_TLS_VERIFY=true if you encounter certificate errors "
                 "with a managed cloud instance (AuraDB)."
             )
+    return uri
 
-    _graph = Neo4jGraph(
+
+def _create_graph(settings: Settings) -> Neo4jGraph:
+    """Instantiate a Neo4jGraph — pure factory, no retry logic."""
+    uri = _resolve_uri(settings)
+    graph = Neo4jGraph(
         url=uri,
         username=settings.neo4j_user,
         password=settings.neo4j_password,
@@ -78,18 +70,135 @@ def init_graph(settings: Settings) -> Neo4jGraph:
         sanitize=True,
         refresh_schema=True,
     )
-    logger.info("Neo4j connection established (database=%s)", settings.neo4j_database)
-    return _graph
+    return graph
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+
+def init_graph(settings: Settings) -> Neo4jGraph:
+    """
+    Create and cache a ``Neo4jGraph`` singleton **with startup retry**.
+
+    If Neo4j is unreachable the function retries up to
+    ``settings.neo4j_startup_max_retries`` times with exponential back-off
+    so the application can survive container-orchestration start-order races.
+    """
+    global _graph, _settings
+    if _graph is not None:
+        return _graph
+
+    _settings = settings
+    max_retries = settings.neo4j_startup_max_retries
+    delay = settings.neo4j_startup_retry_delay
+
+    logger.info("Initialising Neo4j connection to %s", settings.neo4j_uri)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            _graph = _create_graph(settings)
+            logger.info(
+                "Neo4j connection established (database=%s)",
+                settings.neo4j_database,
+            )
+            return _graph
+        except Exception as exc:
+            if attempt == max_retries:
+                logger.error(
+                    "Neo4j connection failed after %d attempts — giving up.",
+                    max_retries,
+                )
+                raise
+            backoff = min(delay * (2 ** (attempt - 1)), 30)  # cap at 30s
+            logger.warning(
+                "Neo4j attempt %d/%d failed: %s — retrying in %.1fs",
+                attempt, max_retries, exc, backoff,
+            )
+            time.sleep(backoff)
+
+    # Should never reach here, but satisfy type checker
+    raise RuntimeError("Neo4j connection failed — exhausted all retries.")
 
 
 def get_graph() -> Neo4jGraph:
-    """Return the existing `Neo4jGraph` singleton (must call `init_graph` first)."""
+    """Return the existing ``Neo4jGraph`` singleton (must call ``init_graph`` first)."""
     if _graph is None:
         raise RuntimeError(
             "Neo4jGraph has not been initialised. "
             "Ensure `init_graph()` is called during application lifespan startup."
         )
     return _graph
+
+
+def ensure_connected() -> Neo4jGraph:
+    """
+    Verify the Neo4j driver is alive; reconnect transparently if it is not.
+
+    Call this at the top of every request-handling path that touches Neo4j
+    to get automatic recovery from connection drops, server restarts, and
+    network partitions without crashing the application.
+
+    Returns the (possibly freshly reconnected) ``Neo4jGraph`` instance.
+    """
+    global _graph
+
+    if _graph is None:
+        raise RuntimeError(
+            "Neo4jGraph has not been initialised. "
+            "Ensure `init_graph()` is called during application lifespan startup."
+        )
+
+    try:
+        # Lightweight connectivity probe — uses the existing driver pool
+        _graph.query("RETURN 1 AS ping")
+        return _graph
+    except Exception as exc:
+        logger.warning("Neo4j connectivity check failed: %s — attempting reconnect.", exc)
+        return reconnect_graph()
+
+
+def reconnect_graph() -> Neo4jGraph:
+    """
+    Tear down the current singleton and create a fresh connection.
+
+    Uses the ``Settings`` captured during ``init_graph()``.
+    """
+    global _graph
+
+    if _settings is None:
+        raise RuntimeError("Cannot reconnect — init_graph() was never called.")
+
+    # Best-effort cleanup of old driver
+    if _graph is not None:
+        try:
+            if hasattr(_graph, "_driver") and _graph._driver:
+                _graph._driver.close()
+        except Exception:
+            logger.debug("Old Neo4j driver cleanup error (ignored)", exc_info=True)
+        _graph = None
+
+    max_retries = _settings.neo4j_startup_max_retries
+    delay = _settings.neo4j_startup_retry_delay
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            _graph = _create_graph(_settings)
+            logger.info("Neo4j reconnected successfully (attempt %d).", attempt)
+            return _graph
+        except Exception as exc:
+            if attempt == max_retries:
+                logger.error(
+                    "Neo4j reconnection failed after %d attempts.", max_retries,
+                )
+                raise
+            backoff = min(delay * (2 ** (attempt - 1)), 30)
+            logger.warning(
+                "Neo4j reconnect attempt %d/%d failed: %s — retrying in %.1fs",
+                attempt, max_retries, exc, backoff,
+            )
+            time.sleep(backoff)
+
+    raise RuntimeError("Neo4j reconnection failed — exhausted all retries.")
 
 
 def close_graph() -> None:

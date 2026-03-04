@@ -10,6 +10,7 @@ from typing import Any
 
 from langchain_neo4j import GraphCypherQAChain
 from langchain_core.language_models import BaseChatModel
+from neo4j.exceptions import ServiceUnavailable, SessionExpired
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -57,7 +58,15 @@ def strip_code_fences(text: str) -> str:
 
 
 def is_cypher_error(exc: Exception) -> bool:
-    """Return True if *exc* looks like a Cypher generation / execution error."""
+    """Return True if *exc* looks like a Cypher generation / execution error.
+
+    Neo4j driver transient errors (``ServiceUnavailable``, ``SessionExpired``)
+    are NOT Cypher errors — they should be handled by the tenacity retry layer,
+    not the LLM self-correction loop.
+    """
+    # Transient connectivity errors → let tenacity handle them
+    if isinstance(exc, (ServiceUnavailable, SessionExpired)):
+        return False
     msg = str(exc).lower()
     indicators = [
         "syntax", "cypher", "invalid input", "unexpected",
@@ -101,7 +110,10 @@ async def execute_with_retries(
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, max=10),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+        retry=retry_if_exception_type((
+            ConnectionError, TimeoutError, OSError,
+            ServiceUnavailable, SessionExpired,
+        )),
         reraise=True,
     )
     def _invoke(q: str) -> dict:
