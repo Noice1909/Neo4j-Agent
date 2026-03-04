@@ -94,10 +94,15 @@ class SchemaCache:
         except Exception as exc:
             logger.warning("Failed to invalidate schema cache: %s", exc)
 
-    def stop_refresh_task(self) -> None:
+    async def stop_refresh_task(self) -> None:
         """Cancel the background proactive-refresh task (call at shutdown)."""
         if self._refresh_task and not self._refresh_task.done():
             self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+        self._refresh_task = None
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

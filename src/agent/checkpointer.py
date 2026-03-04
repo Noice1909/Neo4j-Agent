@@ -125,14 +125,21 @@ async def close_checkpointer() -> None:
     global _checkpointer
     if _checkpointer is not None:
         try:
-            for attr in ("aclose", "close"):
-                closer = getattr(_checkpointer, attr, None)
-                if closer is not None and callable(closer):
-                    import asyncio
-                    result = closer()
-                    if asyncio.iscoroutine(result):
-                        await result
-                    break
+            # AsyncSqliteSaver stores the aiosqlite.Connection as `.conn`.
+            # aiosqlite runs a background thread that must be joined.
+            conn = getattr(_checkpointer, "conn", None)
+            if conn is not None and hasattr(conn, "close"):
+                await conn.close()
+            else:
+                # Fallback: try generic close methods on the saver itself.
+                for attr in ("aclose", "close"):
+                    closer = getattr(_checkpointer, attr, None)
+                    if closer is not None and callable(closer):
+                        import asyncio
+                        result = closer()
+                        if asyncio.iscoroutine(result):
+                            await result
+                        break
         except Exception:
             logger.debug("Checkpointer cleanup error (ignored)", exc_info=True)
         _checkpointer = None

@@ -78,9 +78,8 @@ async def close_checkpointer() -> None:
     global _checkpointer
     if _checkpointer is not None:
         try:
-            # Attempt any close/cleanup method the checkpointer might expose.
-            # Different implementations (AsyncRedisSaver, MemorySaver) expose
-            # different APIs — be defensive.
+            # Try standard close methods first.
+            closed = False
             for attr in ("aclose", "close"):
                 closer = getattr(_checkpointer, attr, None)
                 if closer is not None and callable(closer):
@@ -88,7 +87,18 @@ async def close_checkpointer() -> None:
                     result = closer()
                     if asyncio.iscoroutine(result):
                         await result
+                    closed = True
                     break
+            # If the saver wraps an internal Redis client, close it too.
+            if not closed:
+                redis_conn = getattr(_checkpointer, "_redis", None) or getattr(_checkpointer, "conn", None)
+                if redis_conn is not None:
+                    close_fn = getattr(redis_conn, "aclose", None) or getattr(redis_conn, "close", None)
+                    if close_fn and callable(close_fn):
+                        import asyncio
+                        result = close_fn()
+                        if asyncio.iscoroutine(result):
+                            await result
         except Exception:
             logger.debug("Checkpointer cleanup error (ignored)", exc_info=True)
         _checkpointer = None

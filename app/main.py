@@ -184,7 +184,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     logger.info("═══ %s — shutdown ═══", settings.app_name)
-    schema_cache.stop_refresh_task()
+    await schema_cache.stop_refresh_task()
     await close_checkpointer()
     await redis_client.aclose()
     close_graph()

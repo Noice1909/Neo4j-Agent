@@ -85,10 +85,15 @@ class SchemaCache:
         self._cached_at = 0.0
         logger.info("Schema cache invalidated.")
 
-    def stop_refresh_task(self) -> None:
+    async def stop_refresh_task(self) -> None:
         """Cancel the background proactive-refresh task (call at shutdown)."""
         if self._refresh_task and not self._refresh_task.done():
             self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+        self._refresh_task = None
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
