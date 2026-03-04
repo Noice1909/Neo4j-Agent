@@ -48,7 +48,12 @@ app/
 │       ├── coreference.py         # Pronoun/coreference resolution
 │       ├── callback.py            # CypherSafetyCallback for LangChain
 │       ├── synonyms.py            # Label synonym map (auto + custom)
-│       └── entity_resolver.py     # 3-layer entity resolution pipeline
+│       └── entity_resolution/     # 3-layer entity resolution pipeline
+│           ├── models.py          # Correction / ResolutionResult data classes
+│           ├── capabilities.py    # Neo4j capability probes (index, APOC)
+│           ├── label_resolver.py  # Layer 1: schema-aware label matching
+│           ├── name_resolver.py   # Layer 2: full-text + APOC DB lookups
+│           └── orchestrator.py    # Layer 3 (LLM) + pipeline orchestrator
 ├── llm/
 │   └── factory.py                 # Ollama LLM factory
 └── mcp/

@@ -25,6 +25,12 @@ from app.core.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# URI scheme constants — avoids duplicating literal strings.
+_NEO4J_TLS_SCHEME = "neo4j+s://"
+_NEO4J_TLS_UNVERIFIED_SCHEME = "neo4j+ssc://"
+_BOLT_TLS_SCHEME = "bolt+s://"
+_BOLT_TLS_UNVERIFIED_SCHEME = "bolt+ssc://"
+
 # Module-level singleton — set during app lifespan startup.
 _graph: Neo4jGraph | None = None
 # Keep a reference to the settings used for reconnection.
@@ -37,20 +43,20 @@ def _resolve_uri(settings: Settings) -> str:
     """Apply optional TLS-verification rewrite and return the final URI."""
     uri = settings.neo4j_uri
     if settings.neo4j_skip_tls_verify:
-        if uri.startswith("neo4j+s://"):
-            uri = "neo4j+ssc://" + uri[len("neo4j+s://"):]
+        if uri.startswith(_NEO4J_TLS_SCHEME):
+            uri = _NEO4J_TLS_UNVERIFIED_SCHEME + uri[len(_NEO4J_TLS_SCHEME):]
             logger.warning(
                 "TLS cert verification DISABLED (neo4j+ssc://). "
                 "Only use this for managed cloud instances (AuraDB)."
             )
-        elif uri.startswith("bolt+s://"):
-            uri = "bolt+ssc://" + uri[len("bolt+s://"):]
+        elif uri.startswith(_BOLT_TLS_SCHEME):
+            uri = _BOLT_TLS_UNVERIFIED_SCHEME + uri[len(_BOLT_TLS_SCHEME):]
             logger.warning(
                 "TLS cert verification DISABLED (bolt+ssc://). "
                 "Only use this for managed cloud instances (AuraDB)."
             )
     else:
-        if uri.startswith(("neo4j+s://", "bolt+s://")):
+        if uri.startswith((_NEO4J_TLS_SCHEME, _BOLT_TLS_SCHEME)):
             logger.info(
                 "TLS with full cert verification enabled. "
                 "Set NEO4J_SKIP_TLS_VERIFY=true if you encounter certificate errors "

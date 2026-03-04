@@ -74,6 +74,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_API_V1_PREFIX = "/api/v1"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -216,7 +218,7 @@ def create_app() -> FastAPI:
 
     # ── Request ID middleware (outermost — runs first) ────────────────────────
     @app.middleware("http")
-    async def request_id_middleware(request: Request, call_next) -> Response:
+    async def request_id_middleware(request: Request, call_next) -> Response:  # noqa: F841
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
         request.state.request_id = request_id
         response: Response = await call_next(request)
@@ -260,9 +262,9 @@ def create_app() -> FastAPI:
     app.add_exception_handler(VectorSearchUnavailableError, vector_search_unavailable_handler)  # type: ignore[arg-type]
 
     # ── API routers ───────────────────────────────────────────────────────────
-    app.include_router(chat.router, prefix="/api/v1")
-    app.include_router(sessions.router, prefix="/api/v1")
-    app.include_router(schema.router, prefix="/api/v1")
+    app.include_router(chat.router, prefix=_API_V1_PREFIX)
+    app.include_router(sessions.router, prefix=_API_V1_PREFIX)
+    app.include_router(schema.router, prefix=_API_V1_PREFIX)
     app.include_router(health.router)
 
     # ── FastMCP mount ─────────────────────────────────────────────────────────

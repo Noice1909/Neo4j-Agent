@@ -99,22 +99,15 @@ def extract_cypher_from_error(error_msg: str) -> str | None:
 # ── Retry engine ──────────────────────────────────────────────────────────────
 
 
-async def execute_with_retries(
+async def _run_initial_chain(
     question: str,
     llm: BaseChatModel,
     graph: Any,
-    schema: str,
+    safety_cb: CypherSafetyCallback,
 ) -> str:
-    """
-    Run the Cypher chain, retrying with LLM self-correction on failure.
-
-    Attempt 0: Normal chain invocation with few-shot prompt.
-    Attempts 1‥N: LLM self-correction using the error as context.
-    """
+    """Run the initial Cypher chain with tenacity retry for transient errors."""
     loop = asyncio.get_running_loop()
-    safety_cb = CypherSafetyCallback()
 
-    # ── Strategy #3: Chain with few-shot Cypher prompt ───────────────────
     chain = GraphCypherQAChain.from_llm(
         llm=llm,
         graph=graph,
@@ -124,7 +117,6 @@ async def execute_with_retries(
         cypher_prompt=ENHANCED_CYPHER_PROMPT,
     )
 
-    # Transient-error retry (network / timeout — NOT Cypher errors)
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, max=10),
@@ -139,90 +131,103 @@ async def execute_with_retries(
             {"query": q}, config={"callbacks": [safety_cb]},
         )
 
-    # ── Attempt 0: normal chain invocation ───────────────────────────────
+    result = await loop.run_in_executor(None, lambda: _invoke(question))
+
+    for step in result.get("intermediate_steps", []):
+        if isinstance(step, dict) and "query" in step:
+            validate_read_only(step["query"])
+
+    answer: str = result.get("result", "I could not determine an answer.")
+    logger.info("Graph query answered: %r → %r", question[:60], answer[:120])
+    return answer
+
+
+async def _run_correction_attempt(
+    question: str,
+    llm: BaseChatModel,
+    graph: Any,
+    schema: str,
+    last_cypher: str | None,
+    last_error: str | None,
+    attempt: int,
+) -> str:
+    """Run a single LLM self-correction attempt and return the answer."""
+    loop = asyncio.get_running_loop()
+    correction = build_correction_prompt(
+        question=question,
+        schema=schema,
+        failed_cypher=last_cypher or "N/A",
+        error=last_error or "unknown error",
+    )
+
+    resp = await loop.run_in_executor(
+        None, lambda cp=correction: llm.invoke(cp),
+    )
+    corrected_cypher = strip_code_fences(str(resp.content))
+    logger.info("Retry %d corrected Cypher: %s", attempt, corrected_cypher[:200])
+
+    validate_read_only(corrected_cypher)
+    issues = pre_validate_cypher(corrected_cypher)
+    if issues:
+        raise ValueError(f"Pre-validation: {', '.join(issues)}")
+
+    raw = await loop.run_in_executor(
+        None, lambda cc=corrected_cypher: graph.query(cc),
+    )
+
+    qa_prompt = (
+        f"Question: {question}\n"
+        f"Database results: {raw}\n"
+        "Provide a concise, natural-language answer based on these results."
+    )
+    qa_resp = await loop.run_in_executor(
+        None, lambda qp=qa_prompt: llm.invoke(qp),
+    )
+    answer = str(qa_resp.content).strip()
+    logger.info(
+        "Graph query answered (retry %d): %r → %r",
+        attempt, question[:60], answer[:120],
+    )
+    return answer
+
+
+async def execute_with_retries(
+    question: str,
+    llm: BaseChatModel,
+    graph: Any,
+    schema: str,
+) -> str:
+    """Run the Cypher chain, retrying with LLM self-correction on failure."""
+    safety_cb = CypherSafetyCallback()
+
     last_error: str | None = None
     last_cypher: str | None = None
 
     try:
-        result = await loop.run_in_executor(None, lambda: _invoke(question))
-
-        # Belt-and-suspenders: validate intermediate Cypher post-execution
-        for step in result.get("intermediate_steps", []):
-            if isinstance(step, dict) and "query" in step:
-                validate_read_only(step["query"])
-
-        answer: str = result.get("result", "I could not determine an answer.")
-        logger.info("Graph query answered: %r → %r", question[:60], answer[:120])
-        return answer
-
+        return await _run_initial_chain(question, llm, graph, safety_cb)
     except ReadOnlyViolationError:
-        raise  # never retry write attempts
-
+        raise
     except Exception as exc:
         if not is_cypher_error(exc):
-            raise  # non-Cypher errors (auth, connectivity) bubble up
-
+            raise
         last_error = str(exc)
         last_cypher = (
             safety_cb.last_generated_cypher
             or extract_cypher_from_error(last_error)
         )
-        logger.warning(
-            "Cypher attempt 0 failed (retryable): %s", last_error[:200],
-        )
+        logger.warning("Cypher attempt 0 failed (retryable): %s", last_error[:200])
 
-    # ── Attempts 1‥N: LLM self-correction (Strategy #1) ─────────────────
     for attempt in range(1, MAX_CYPHER_RETRIES + 1):
         try:
-            correction = build_correction_prompt(
-                question=question,
-                schema=schema,
-                failed_cypher=last_cypher or "N/A",
-                error=last_error or "unknown error",
+            return await _run_correction_attempt(
+                question, llm, graph, schema,
+                last_cypher, last_error, attempt,
             )
-
-            # Ask LLM for corrected Cypher
-            resp = await loop.run_in_executor(
-                None, lambda cp=correction: llm.invoke(cp),
-            )
-            corrected_cypher = strip_code_fences(str(resp.content))
-            logger.info(
-                "Retry %d corrected Cypher: %s", attempt, corrected_cypher[:200],
-            )
-
-            # Strategy #4 — pre-validate before hitting Neo4j
-            validate_read_only(corrected_cypher)
-            issues = pre_validate_cypher(corrected_cypher)
-            if issues:
-                last_error = f"Pre-validation: {', '.join(issues)}"
-                last_cypher = corrected_cypher
-                logger.warning("Corrected Cypher still invalid: %s", last_error)
-                continue
-
-            # Execute directly against Neo4j
-            raw = await loop.run_in_executor(
-                None, lambda cc=corrected_cypher: graph.query(cc),
-            )
-
-            # Generate natural-language answer from raw results
-            qa_prompt = (
-                f"Question: {question}\n"
-                f"Database results: {raw}\n"
-                "Provide a concise, natural-language answer based on these results."
-            )
-            qa_resp = await loop.run_in_executor(
-                None, lambda qp=qa_prompt: llm.invoke(qp),
-            )
-            answer = str(qa_resp.content).strip()
-            logger.info(
-                "Graph query answered (retry %d): %r → %r",
-                attempt, question[:60], answer[:120],
-            )
-            return answer
-
         except ReadOnlyViolationError:
             raise
-
+        except ValueError as exc:
+            last_error = str(exc)
+            logger.warning("Corrected Cypher still invalid: %s", last_error)
         except Exception as exc:
             last_error = str(exc)
             logger.warning("Cypher retry %d failed: %s", attempt, last_error[:200])
@@ -231,3 +236,4 @@ async def execute_with_retries(
         f"All {MAX_CYPHER_RETRIES + 1} Cypher attempts failed.  "
         f"Last error: {last_error}"
     )
+

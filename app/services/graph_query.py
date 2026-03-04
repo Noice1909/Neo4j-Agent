@@ -22,7 +22,7 @@ from app.core.config import get_settings
 from app.core.exceptions import ReadOnlyViolationError
 from app.graph.connection import get_graph, ensure_connected
 from app.graph.cypher.coreference import resolve_coreferences
-from app.graph.cypher.entity_resolver import resolve_entities
+from app.graph.cypher.entity_resolution import resolve_entities
 from app.graph.cypher.retry import execute_with_retries
 from app.graph.schema_cache import SchemaCache
 

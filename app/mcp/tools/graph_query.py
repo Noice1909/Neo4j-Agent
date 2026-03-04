@@ -55,5 +55,5 @@ def register_mcp_tool(mcp, llm: BaseChatModel, schema_cache: SchemaCache) -> Non
             "Always attempt to answer directly — never ask for clarification."
         ),
     )
-    async def _mcp_query_graph(question: str) -> str:
+    async def _mcp_query_graph(question: str) -> str:  # noqa: F841
         return await run_graph_query(question, llm, schema_cache)

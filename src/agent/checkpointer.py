@@ -120,28 +120,35 @@ def get_checkpointer() -> "BaseCheckpointSaver":
     return _checkpointer
 
 
+async def _try_close(obj: object) -> bool:
+    """Attempt to close *obj* via aclose/close. Returns True on success."""
+    for attr in ("aclose", "close"):
+        closer = getattr(obj, attr, None)
+        if closer is not None and callable(closer):
+            import asyncio
+            result = closer()
+            if asyncio.iscoroutine(result):
+                await result
+            return True
+    return False
+
+
 async def close_checkpointer() -> None:
     """Close the underlying connection on shutdown."""
     global _checkpointer
-    if _checkpointer is not None:
-        try:
-            # AsyncSqliteSaver stores the aiosqlite.Connection as `.conn`.
-            # aiosqlite runs a background thread that must be joined.
-            conn = getattr(_checkpointer, "conn", None)
-            if conn is not None and hasattr(conn, "close"):
-                await conn.close()
-            else:
-                # Fallback: try generic close methods on the saver itself.
-                for attr in ("aclose", "close"):
-                    closer = getattr(_checkpointer, attr, None)
-                    if closer is not None and callable(closer):
-                        import asyncio
-                        result = closer()
-                        if asyncio.iscoroutine(result):
-                            await result
-                        break
-        except Exception:
-            logger.debug("Checkpointer cleanup error (ignored)", exc_info=True)
-        _checkpointer = None
-        logger.info("Checkpointer connection closed.")
+    if _checkpointer is None:
+        return
+    try:
+        # AsyncSqliteSaver stores the aiosqlite.Connection as `.conn`.
+        # aiosqlite runs a background thread that must be joined.
+        conn = getattr(_checkpointer, "conn", None)
+        if conn is not None and hasattr(conn, "close"):
+            await conn.close()
+        else:
+            await _try_close(_checkpointer)
+    except Exception:
+        logger.debug("Checkpointer cleanup error (ignored)", exc_info=True)
+    _checkpointer = None
+    logger.info("Checkpointer connection closed.")
+
 

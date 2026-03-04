@@ -13,7 +13,7 @@ from src.graph.cypher.synonyms import (
     build_synonym_map,
     DEFAULT_SYNONYMS,
 )
-from src.graph.cypher.entity_resolver import (
+from src.graph.cypher.entity_resolution import (
     Correction,
     LabelResolver,
     ResolutionResult,

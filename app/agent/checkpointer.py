@@ -73,33 +73,32 @@ def get_checkpointer() -> "BaseCheckpointSaver":
     return _checkpointer
 
 
+async def _try_close(obj: object) -> bool:
+    """Attempt to close *obj* via aclose/close. Returns True on success."""
+    for attr in ("aclose", "close"):
+        closer = getattr(obj, attr, None)
+        if closer is not None and callable(closer):
+            import asyncio
+            result = closer()
+            if asyncio.iscoroutine(result):
+                await result
+            return True
+    return False
+
+
 async def close_checkpointer() -> None:
     """Close the underlying Redis connection on shutdown."""
     global _checkpointer
-    if _checkpointer is not None:
-        try:
-            # Try standard close methods first.
-            closed = False
-            for attr in ("aclose", "close"):
-                closer = getattr(_checkpointer, attr, None)
-                if closer is not None and callable(closer):
-                    import asyncio
-                    result = closer()
-                    if asyncio.iscoroutine(result):
-                        await result
-                    closed = True
-                    break
+    if _checkpointer is None:
+        return
+    try:
+        if not await _try_close(_checkpointer):
             # If the saver wraps an internal Redis client, close it too.
-            if not closed:
-                redis_conn = getattr(_checkpointer, "_redis", None) or getattr(_checkpointer, "conn", None)
-                if redis_conn is not None:
-                    close_fn = getattr(redis_conn, "aclose", None) or getattr(redis_conn, "close", None)
-                    if close_fn and callable(close_fn):
-                        import asyncio
-                        result = close_fn()
-                        if asyncio.iscoroutine(result):
-                            await result
-        except Exception:
-            logger.debug("Checkpointer cleanup error (ignored)", exc_info=True)
-        _checkpointer = None
-        logger.info("Checkpointer connection closed.")
+            redis_conn = getattr(_checkpointer, "_redis", None) or getattr(_checkpointer, "conn", None)
+            if redis_conn is not None:
+                await _try_close(redis_conn)
+    except Exception:
+        logger.debug("Checkpointer cleanup error (ignored)", exc_info=True)
+    _checkpointer = None
+    logger.info("Checkpointer connection closed.")
+

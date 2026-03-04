@@ -19,7 +19,6 @@ from langchain_core.language_models import BaseChatModel
 from langchain_neo4j import Neo4jVector
 
 from app.core.exceptions import VectorSearchUnavailableError
-from app.graph.connection import get_graph
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +62,6 @@ async def run_vector_search(
         If the vector index is missing or embeddings are not configured.
     """
     import asyncio
-
-    graph = get_graph()
 
     try:
         # Neo4jVector requires an embedding model — use the LLM's embedding
@@ -159,7 +156,7 @@ def register_mcp_tool(mcp, llm: BaseChatModel, index_name: str = _DEFAULT_INDEX)
             "Requires a pre-configured vector index."
         ),
     )
-    async def _mcp_vector_search(query: str, k: int = _DEFAULT_K) -> str:
+    async def _mcp_vector_search(query: str, k: int = _DEFAULT_K) -> str:  # noqa: F841
         try:
             return await run_vector_search(query, llm, index_name=index_name, k=k)
         except VectorSearchUnavailableError as exc:
