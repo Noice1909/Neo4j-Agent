@@ -61,6 +61,8 @@ class GraphTopology:
     labels: list[LabelInfo] = field(default_factory=list)
     triples: list[RelationshipTriple] = field(default_factory=list)
     chains: list[list[RelationshipTriple]] = field(default_factory=list)
+    # primary_label → [other labels that co-occur on the same physical nodes]
+    label_aliases: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def label_names(self) -> list[str]:
@@ -107,6 +109,12 @@ RETURN DISTINCT labels(a)[0] AS src, type(r) AS rel, labels(b)[0] AS tgt
 LIMIT 500
 """
 
+# Detects nodes that carry more than one label so we can build an alias map.
+_MULTI_LABEL_QUERY = """\
+MATCH (n) WHERE size(labels(n)) > 1
+RETURN DISTINCT labels(n) AS label_group LIMIT 300
+"""
+
 _LABELS_QUERY = "CALL db.labels() YIELD label RETURN label ORDER BY label"
 
 
@@ -116,6 +124,40 @@ def _sample_query(label: str) -> str:
     return f"MATCH (n:`{safe}`) RETURN properties(n) AS props LIMIT 1"
 
 
+def _build_label_aliases(
+    multi_label_rows: list[dict],
+    known_labels: set[str],
+) -> dict[str, list[str]]:
+    """
+    Build a primary_label → [alias_labels] map from multi-label node groups.
+
+    The "primary" label is whichever member of the group already appears as a
+    source or target in the triples query (i.e. is in *known_labels*), chosen
+    alphabetically.  Unknown co-labels are listed as aliases.
+    """
+    aliases: dict[str, list[str]] = {}
+    for row in multi_label_rows:
+        _merge_group(row.get("label_group") or [], known_labels, aliases)
+    return aliases
+
+
+def _merge_group(
+    group: list[str],
+    known_labels: set[str],
+    aliases: dict[str, list[str]],
+) -> None:
+    """Merge one label group into the alias map (mutates *aliases*)."""
+    if len(group) < 2:
+        return
+    known_in_group = sorted(lbl for lbl in group if lbl in known_labels)
+    if not known_in_group:
+        return
+    primary = known_in_group[0]
+    others = known_in_group[1:] + [lbl for lbl in group if lbl not in known_labels]
+    current = aliases.setdefault(primary, [])
+    current.extend(alias for alias in others if alias not in current)
+
+
 def _detect_display_property(props: list[str]) -> str | None:
     """Pick the best display property using a priority list."""
     lower = {p.lower(): p for p in props}
@@ -123,6 +165,32 @@ def _detect_display_property(props: list[str]) -> str | None:
         if candidate in lower:
             return lower[candidate]
     return props[0] if props else None
+
+
+async def _fetch_label_infos(
+    loop: asyncio.AbstractEventLoop,
+    graph: "Neo4jGraph",
+    label_names: list[str],
+) -> list[LabelInfo]:
+    """Fetch properties and sample values for every label (one query each)."""
+    label_infos: list[LabelInfo] = []
+    for label in label_names:
+        try:
+            rows = await loop.run_in_executor(None, graph.query, _sample_query(label))
+            props_map: dict = rows[0]["props"] if rows and rows[0].get("props") else {}
+            props = list(props_map.keys())
+            sample_values = {k: str(v) for k, v in props_map.items() if v is not None}
+        except Exception as exc:
+            logger.debug("Topology: property sample for %s failed: %s", label, exc)
+            props = []
+            sample_values = {}
+        label_infos.append(LabelInfo(
+            label=label,
+            properties=props,
+            display_property=_detect_display_property(props),
+            sample_values=sample_values,
+        ))
+    return label_infos
 
 
 # ── Chain detection (DFS) ─────────────────────────────────────────────────────
@@ -252,6 +320,21 @@ async def extract_topology(graph: "Neo4jGraph") -> GraphTopology:
         except Exception:
             logger.debug("APOC meta.schema() unavailable — using unenriched triples.")
 
+    # ── 1c. Multi-label alias detection ───────────────────────────────────────
+    label_aliases: dict[str, list[str]] = {}
+    try:
+        known_labels = {t.source_label for t in triples} | {t.target_label for t in triples}
+        multi_rows = await loop.run_in_executor(None, graph.query, _MULTI_LABEL_QUERY)
+        label_aliases = _build_label_aliases(multi_rows, known_labels)
+        if label_aliases:
+            logger.info(
+                "Topology: detected %d multi-label alias group(s): %s",
+                len(label_aliases),
+                label_aliases,
+            )
+    except Exception as exc:
+        logger.debug("Topology: multi-label alias detection failed: %s", exc)
+
     # ── 2. Node labels ─────────────────────────────────────────────────────────
     label_names: list[str] = []
     try:
@@ -268,33 +351,18 @@ async def extract_topology(graph: "Neo4jGraph") -> GraphTopology:
         label_names = sorted(seen)
 
     # ── 3. Properties + sample values per label ────────────────────────────────
-    label_infos: list[LabelInfo] = []
-    for label in label_names:
-        try:
-            rows = await loop.run_in_executor(None, graph.query, _sample_query(label))
-            props_map: dict = rows[0]["props"] if rows and rows[0].get("props") else {}
-            props = list(props_map.keys())
-            sample_values = {k: str(v) for k, v in props_map.items() if v is not None}
-        except Exception as exc:
-            logger.debug("Topology: property sample for %s failed: %s", label, exc)
-            props = []
-            sample_values = {}
-
-        display = _detect_display_property(props)
-        label_infos.append(
-            LabelInfo(
-                label=label,
-                properties=props,
-                display_property=display,
-                sample_values=sample_values,
-            )
-        )
+    label_infos = await _fetch_label_infos(loop, graph, label_names)
 
     # ── 4. Multi-hop chain detection ───────────────────────────────────────────
     chains = _find_chains(triples)
     logger.info("Topology: detected %d multi-hop chains.", len(chains))
 
-    topology = GraphTopology(labels=label_infos, triples=triples, chains=chains)
+    topology = GraphTopology(
+        labels=label_infos,
+        triples=triples,
+        chains=chains,
+        label_aliases=label_aliases,
+    )
     logger.info(
         "Topology extraction complete: %d labels, %d triples, %d chains.",
         len(topology.labels),

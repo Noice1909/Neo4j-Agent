@@ -51,11 +51,40 @@ def _render_chain(chain: "list[RelationshipTriple]") -> str:
     return "".join(parts)
 
 
+def _prefer_hints(
+    triple: "RelationshipTriple",
+    endpoint_rels: "dict[tuple[str, str], list[tuple[str, int]]]",
+) -> list[str]:
+    """Return ⚠ prefer-lines for *triple* when competing lower-frequency rels exist."""
+    if triple.count <= 0:
+        return []
+    siblings = endpoint_rels.get((triple.source_label, triple.target_label), [])
+    return [
+        f"    \u26a0 Prefer [:{triple.rel_type}] ({triple.count:,} uses) "
+        f"over [:{other_rel}] ({other_count:,} uses)"
+        for other_rel, other_count in siblings
+        if other_rel != triple.rel_type and 0 < other_count < triple.count
+    ]
+
+
 def _triple_lines(topology: "GraphTopology") -> list[str]:
-    """Render the per-triple block with counts and filter-by-target examples."""
+    """
+    Render the per-triple block sorted by count descending.
+
+    Adds a ⚠ "Prefer X over Y" hint when multiple rel types connect the same
+    pair of labels so the LLM picks the high-frequency one.
+    """
+    sorted_triples = sorted(topology.triples, key=lambda t: t.count, reverse=True)
+
+    endpoint_rels: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    for t in sorted_triples:
+        endpoint_rels.setdefault((t.source_label, t.target_label), []).append(
+            (t.rel_type, t.count)
+        )
+
     lines: list[str] = ["Relationship topology (use ONLY these types):"]
-    for t in topology.triples:
-        bidi = " ↔ (bidirectional)" if t.bidirectional else ""
+    for t in sorted_triples:
+        bidi = " \u2194 (bidirectional)" if t.bidirectional else ""
         count_note = f" [{t.count:,} relationships]" if t.count > 0 else ""
         lines.append(
             f"  ({t.source_label})-[:{t.rel_type}]->({t.target_label}){bidi}{count_note}"
@@ -65,7 +94,54 @@ def _triple_lines(topology: "GraphTopology") -> list[str]:
             f"MATCH (a:{t.source_label})-[:{t.rel_type}]->"
             f"(b:{t.target_label} {{name:'X'}}) RETURN a"
         )
+        lines.extend(_prefer_hints(t, endpoint_rels))
     return lines
+
+
+def _alias_lines(topology: "GraphTopology") -> list[str]:
+    """Render the label-alias block (empty if no multi-label nodes detected)."""
+    if not topology.label_aliases:
+        return []
+    lines = ["", "Node label aliases (same physical nodes carry multiple labels):"]
+    for primary, aliases in sorted(topology.label_aliases.items()):
+        lines.append(
+            f"  {primary} \u2261 {', '.join(aliases)} \u2014 use either in MATCH patterns"
+        )
+    return lines
+
+
+def _negative_constraint_lines(topology: "GraphTopology") -> list[str]:
+    """
+    Auto-derive missing direct paths from multi-hop chains.
+
+    For each chain A→B→C where no direct A→C triple exists, emit a
+    constraint note so the LLM doesn't invent a shortcut.  Capped at 10.
+    """
+    if not topology.chains:
+        return []
+
+    direct_pairs = {(t.source_label, t.target_label) for t in topology.triples}
+    constraints: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    for chain in topology.chains:
+        if len(chain) < 2:
+            continue
+        src = chain[0].source_label
+        tgt = chain[-1].target_label
+        if (src, tgt) in seen or (src, tgt) in direct_pairs:
+            continue
+        seen.add((src, tgt))
+        via = " \u2192 ".join(t.target_label for t in chain[:-1])
+        constraints.append(
+            f"  \u2691 No direct ({src})-[*]->({tgt}) path \u2014 use multi-hop via {via}."
+        )
+        if len(constraints) >= 10:
+            break
+
+    if not constraints:
+        return []
+    return ["", "Path constraints (no direct shortcuts exist):"] + constraints
 
 
 def _chain_lines(topology: "GraphTopology") -> list[str]:
@@ -116,6 +192,8 @@ def build_topology_section(
         return ""
 
     lines = _triple_lines(topology)
+    lines += _alias_lines(topology)
+    lines += _negative_constraint_lines(topology)
     lines += _chain_lines(topology)
     lines += _prop_lines(topology)
 

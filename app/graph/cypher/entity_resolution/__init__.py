@@ -9,6 +9,7 @@ from app.graph.cypher.entity_resolution.label_resolver import LabelResolver
 from app.graph.cypher.entity_resolution.models import (
     Correction,
     FULLTEXT_INDEX_NAME,
+    FULLTEXT_ID_INDEX_NAME,
     ResolutionResult,
 )
 from app.graph.cypher.entity_resolution.capabilities import (
@@ -22,6 +23,7 @@ from app.graph.cypher.entity_resolution.orchestrator import resolve_entities
 __all__ = [
     "Correction",
     "EntityNameResolver",
+    "FULLTEXT_ID_INDEX_NAME",
     "FULLTEXT_INDEX_NAME",
     "LabelResolver",
     "ResolutionResult",

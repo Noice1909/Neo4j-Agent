@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_neo4j import GraphCypherQAChain
 from langchain_core.language_models import BaseChatModel
@@ -21,9 +21,13 @@ from tenacity import (
 from app.graph.cypher.callback import CypherSafetyCallback
 from app.graph.cypher.prompts import UNIVERSAL_CYPHER_RULES, _FALLBACK_PROMPT
 from app.graph.cypher.safety import validate_read_only
+from app.graph.cypher.schema_validation import validate_cypher_schema
 from app.graph.cypher.validation import pre_validate_cypher, validate_relationship_types
 from app.core.exceptions import ReadOnlyViolationError
 from app.core.tracing import trace_event
+
+if TYPE_CHECKING:
+    from app.graph.topology import GraphTopology
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,7 @@ def build_correction_prompt(
     failed_cypher: str,
     error: str,
     topology_section: str = "",
+    schema_errors: list[str] | None = None,
 ) -> str:
     """Build a prompt asking the LLM to fix a failed Cypher query."""
     parts = [
@@ -50,6 +55,13 @@ def build_correction_prompt(
         f"\nRules:\n{UNIVERSAL_CYPHER_RULES}",
         f"\nOriginal question: {question}",
         f"\nFailed Cypher:\n{failed_cypher}",
+    ]
+    if schema_errors:
+        parts.append(
+            "\nSchema violations detected:\n"
+            + "\n".join(f"  - {e}" for e in schema_errors)
+        )
+    parts += [
         f"\nError message:\n{error}",
         "\nCorrected Cypher:",
     ]
@@ -75,7 +87,6 @@ def is_cypher_error(exc: Exception) -> bool:
     are NOT Cypher errors — they should be handled by the tenacity retry layer,
     not the LLM self-correction loop.
     """
-    # Transient connectivity errors → let tenacity handle them
     if isinstance(exc, (ServiceUnavailable, SessionExpired)):
         return False
     msg = str(exc).lower()
@@ -154,15 +165,23 @@ async def _run_correction_attempt(
     attempt: int,
     topology_section: str = "",
     valid_rel_types: set[str] | None = None,
+    topology: "GraphTopology | None" = None,
 ) -> str:
     """Run a single LLM self-correction attempt and return the answer."""
     loop = asyncio.get_running_loop()
+
+    schema_errors: list[str] | None = None
+    if topology and last_cypher:
+        errs = validate_cypher_schema(last_cypher, topology)
+        schema_errors = errs or None
+
     correction = build_correction_prompt(
         question=question,
         schema=schema,
         failed_cypher=last_cypher or "N/A",
         error=last_error or "unknown error",
         topology_section=topology_section,
+        schema_errors=schema_errors,
     )
 
     resp = await loop.run_in_executor(
@@ -183,6 +202,14 @@ async def _run_correction_attempt(
             raise ValueError(
                 f"Unknown relationship type(s): {', '.join(invalid)}. "
                 f"Valid types: {', '.join(sorted(valid_rel_types))}"
+            )
+
+    if topology:
+        remaining = validate_cypher_schema(corrected_cypher, topology)
+        if remaining:
+            raise ValueError(
+                "Schema violations in corrected Cypher:\n"
+                + "\n".join(f"  - {e}" for e in remaining)
             )
 
     raw = await loop.run_in_executor(
@@ -214,9 +241,10 @@ async def execute_with_retries(
     cypher_prompt: Any = None,
     topology_section: str = "",
     valid_rel_types: set[str] | None = None,
+    topology: "GraphTopology | None" = None,
 ) -> str:
     """Run the Cypher chain, retrying with LLM self-correction on failure."""
-    safety_cb = CypherSafetyCallback(valid_rel_types=valid_rel_types)
+    safety_cb = CypherSafetyCallback(valid_rel_types=valid_rel_types, topology=topology)
 
     last_error: str | None = None
     last_cypher: str | None = None
@@ -243,11 +271,11 @@ async def execute_with_retries(
                 last_cypher, last_error, attempt,
                 topology_section=topology_section,
                 valid_rel_types=valid_rel_types,
+                topology=topology,
             )
         except ReadOnlyViolationError:
             raise
         except ValueError as exc:
-            # Pre-validation failure — update error and continue
             last_error = str(exc)
             logger.warning("Corrected Cypher still invalid: %s", last_error)
             trace_event("CYPHER_CORRECTION", "fail", f"Retry {attempt} invalid: {last_error[:80]}")
@@ -261,4 +289,3 @@ async def execute_with_retries(
         f"All {MAX_CYPHER_RETRIES + 1} Cypher attempts failed.  "
         f"Last error: {last_error}"
     )
-

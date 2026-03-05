@@ -39,10 +39,9 @@ def detect_fulltext_index(
 
     logger.warning(
         "Full-text index '%s' NOT found. Layer 2 will use APOC fallback "
-        "(slower on large databases). Ask your Neo4j admin to run:\n"
-        "  CREATE FULLTEXT INDEX %s IF NOT EXISTS\n"
-        "  FOR (n) ON EACH [n.name, n.title]",
-        index_name, index_name,
+        "(slower on large databases). Expected admin-created indexes: "
+        "'globalNameIndex' (name search) and 'globalIndex' (ID search).",
+        index_name,
     )
     return False
 

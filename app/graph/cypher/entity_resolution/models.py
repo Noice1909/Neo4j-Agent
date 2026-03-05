@@ -17,8 +17,10 @@ _NON_WORD_RE = re.compile(r"[^\w]")
 # Regex for escaping special characters in Lucene queries.
 _LUCENE_SPECIAL_RE = re.compile(r'([+\-&|!(){}[\]^"~*?:\\\/ ])')
 
-# Default full-text index name.  Configurable via ENTITY_FULLTEXT_INDEX_NAME.
-FULLTEXT_INDEX_NAME = "entityNameIndex"
+# Full-text index for name lookups (admin-created: globalNameIndex).
+FULLTEXT_INDEX_NAME = "globalNameIndex"
+# Full-text index for ID lookups (admin-created: globalIndex).
+FULLTEXT_ID_INDEX_NAME = "globalIndex"
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────

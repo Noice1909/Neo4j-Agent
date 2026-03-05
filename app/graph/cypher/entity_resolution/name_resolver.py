@@ -1,8 +1,11 @@
 """
 Layer 2 — Entity Name Resolution (data-aware DB lookup).
 
-Strategies (fastest → slowest): 2a) Full-text index (~1 ms),
-2b) APOC multi-signal (~50-500 ms), 2c) APOC phonetic (~50-500 ms).
+Strategies (fastest → slowest):
+  2a-id) globalIndex full-text index — ID-based lookup (~1 ms),
+  2a)    globalNameIndex full-text index — name fuzzy search (~1 ms),
+  2b)    APOC multi-signal — label-scoped similarity (~50-500 ms),
+  2c)    APOC phonetic — doubleMetaphone fallback (~50-500 ms).
 Read-only — no indexes created, no data written.
 """
 from __future__ import annotations
@@ -22,6 +25,7 @@ from app.graph.cypher.entity_resolution.label_resolver import LabelResolver
 from app.graph.cypher.entity_resolution.models import (
     Correction,
     FULLTEXT_INDEX_NAME,
+    FULLTEXT_ID_INDEX_NAME,
     _LUCENE_SPECIAL_RE,
 )
 
@@ -37,8 +41,8 @@ class EntityNameResolver:
 
     Designed for **read-only accounts** and **3M+ node databases**:
 
-    - **2a — Full-text index** (if admin created ``entityNameIndex``):
-      Uses Lucene fuzzy ``~`` operator.  Sub-millisecond, zero RAM.
+    - **2a-id — ID index** (``globalIndex``): exact/fuzzy lookup by node ID.
+    - **2a — Name index** (``globalNameIndex``): Lucene fuzzy ``~`` on names.
     - **2b — APOC multi-signal** (no index, APOC available):
       Label-scoped query using averaged Levenshtein + Sørensen-Dice
       + Jaro-Winkler scores.
@@ -55,6 +59,7 @@ class EntityNameResolver:
         fuzzy_threshold: float = 0.75,
         max_candidates: int = 5,
         fulltext_index_name: str = FULLTEXT_INDEX_NAME,
+        id_index_name: str = FULLTEXT_ID_INDEX_NAME,
         display_properties: list[str] | None = None,
     ) -> None:
         self._graph = graph
@@ -62,12 +67,16 @@ class EntityNameResolver:
         self._fuzzy_threshold = fuzzy_threshold
         self._max_candidates = max_candidates
         self._index_name = fulltext_index_name
+        self._id_index_name = id_index_name
         # Build the COALESCE expression for name retrieval dynamically
         props = display_properties or ["name", "title"]
         coalesce_args = ", ".join(f"node.{p}" for p in props)
         self._name_coalesce = f"COALESCE({coalesce_args})"
 
         # Detect capabilities once (read-only probes)
+        self._has_id_index = (
+            detect_fulltext_index(graph, id_index_name) if schema else False
+        )
         self._has_fulltext = (
             detect_fulltext_index(graph, fulltext_index_name) if schema else False
         )
@@ -144,7 +153,35 @@ class EntityNameResolver:
 
         return candidates
 
-    # ── 2a: Full-text index query ────────────────────────────────────────
+    # ── 2a-id: globalIndex query (ID-based lookup) ───────────────────────
+
+    @lru_cache(maxsize=256)
+    def _id_index_query(self, candidate: str) -> list[dict]:
+        """Exact/fuzzy search via globalIndex (ID-based full-text index, ~1 ms)."""
+        escaped = _LUCENE_SPECIAL_RE.sub(r"\\\\\\1", candidate)
+        # Use fuzzy only for longer tokens; short IDs match exactly
+        search_term = escaped + "~" if len(candidate) > 3 else escaped
+        cypher = (
+            "CALL db.index.fulltext.queryNodes($indexName, $term) "
+            "YIELD node, score "
+            "RETURN labels(node)[0] AS label, "
+            f"{self._name_coalesce} AS name, score "
+            "LIMIT $limit"
+        )
+        try:
+            return self._graph.query(
+                cypher,
+                params={
+                    "indexName": self._id_index_name,
+                    "term": search_term,
+                    "limit": self._max_candidates,
+                },
+            )
+        except Exception as exc:
+            logger.warning("ID index entity lookup failed: %s", exc)
+            return []
+
+    # ── 2a: globalNameIndex query (name-based lookup) ────────────────────
 
     @lru_cache(maxsize=256)
     def _fulltext_query(self, candidate: str) -> list[dict]:
@@ -262,9 +299,19 @@ class EntityNameResolver:
         self, candidate: str, labels: list[str],
     ) -> str | None:
         """Try each sub-layer until a confident match is found."""
-        # ── 2a: Full-text index (fastest) ────────────────────────────────
+        loop = asyncio.get_running_loop()
+
+        # ── 2a-id: globalIndex (ID lookup) ───────────────────────────────
+        if self._has_id_index:
+            results = await loop.run_in_executor(
+                None, self._id_index_query, candidate,
+            )
+            best = self._pick_best(results, candidate)
+            if best:
+                return best
+
+        # ── 2a: globalNameIndex (name fuzzy search) ──────────────────────
         if self._has_fulltext:
-            loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(
                 None, self._fulltext_query, candidate,
             )

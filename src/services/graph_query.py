@@ -71,6 +71,7 @@ async def run_graph_query(
         synonym_overrides=settings.entity_synonym_overrides,
         max_candidates=settings.entity_max_candidates,
         fulltext_index_name=settings.entity_fulltext_index_name,
+        id_index_name=settings.entity_id_index_name,
         display_properties=topology.display_properties,
         topology_section=topology_section_full,
     )
@@ -92,6 +93,7 @@ async def run_graph_query(
             cypher_prompt=cypher_prompt,
             topology_section=topology_section,
             valid_rel_types=topology.valid_rel_types,
+            topology=topology,
         )
     except ReadOnlyViolationError:
         raise

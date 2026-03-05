@@ -60,7 +60,8 @@ class Settings(BaseSettings):
     entity_fuzzy_threshold: float = 0.75         # Levenshtein similarity cutoff (0.0–1.0)
     entity_synonym_overrides: str = ""           # JSON string of custom synonyms
     entity_max_candidates: int = 5               # Max candidates from DB lookup
-    entity_fulltext_index_name: str = "entityNameIndex"  # Full-text index name (admin-created)
+    entity_fulltext_index_name: str = "globalNameIndex"  # Full-text name index (admin-created: globalNameIndex)
+    entity_id_index_name: str = "globalIndex"             # Full-text ID index (admin-created: globalIndex)
 
     # ── Application ──────────────────────────────────────────────────────────
     app_name: str = "Neo4j Agent"

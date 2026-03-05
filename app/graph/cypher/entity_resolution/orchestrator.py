@@ -16,6 +16,7 @@ from app.graph.cypher.entity_resolution.label_resolver import LabelResolver
 from app.graph.cypher.entity_resolution.models import (
     Correction,
     FULLTEXT_INDEX_NAME,
+    FULLTEXT_ID_INDEX_NAME,
     ResolutionResult,
 )
 from app.graph.cypher.entity_resolution.name_resolver import EntityNameResolver
@@ -132,6 +133,7 @@ async def resolve_entities(
     synonym_overrides: str = "",
     max_candidates: int = 5,
     fulltext_index_name: str = FULLTEXT_INDEX_NAME,
+    id_index_name: str = FULLTEXT_ID_INDEX_NAME,
     display_properties: list[str] | None = None,
     topology_section: str = "",
 ) -> ResolutionResult:
@@ -191,6 +193,7 @@ async def resolve_entities(
             fuzzy_threshold=fuzzy_threshold,
             max_candidates=max_candidates,
             fulltext_index_name=fulltext_index_name,
+            id_index_name=id_index_name,
             display_properties=display_properties,
         )
         current_question, name_corrections = await name_resolver.resolve(

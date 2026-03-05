@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_neo4j import GraphCypherQAChain
 from langchain_core.language_models import BaseChatModel
@@ -21,9 +21,13 @@ from tenacity import (
 from src.graph.cypher.callback import CypherSafetyCallback
 from src.graph.cypher.prompts import UNIVERSAL_CYPHER_RULES, _FALLBACK_PROMPT
 from src.graph.cypher.safety import validate_read_only
+from src.graph.cypher.schema_validation import validate_cypher_schema
 from src.graph.cypher.validation import pre_validate_cypher, validate_relationship_types
 from src.core.exceptions import ReadOnlyViolationError
 from src.core.tracing import trace_event
+
+if TYPE_CHECKING:
+    from src.graph.topology import GraphTopology
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,7 @@ def build_correction_prompt(
     failed_cypher: str,
     error: str,
     topology_section: str = "",
+    schema_errors: list[str] | None = None,
 ) -> str:
     """Build a prompt asking the LLM to fix a failed Cypher query."""
     parts = [
@@ -50,6 +55,13 @@ def build_correction_prompt(
         f"\nRules:\n{UNIVERSAL_CYPHER_RULES}",
         f"\nOriginal question: {question}",
         f"\nFailed Cypher:\n{failed_cypher}",
+    ]
+    if schema_errors:
+        parts.append(
+            "\nSchema violations detected:\n"
+            + "\n".join(f"  - {e}" for e in schema_errors)
+        )
+    parts += [
         f"\nError message:\n{error}",
         "\nCorrected Cypher:",
     ]
@@ -154,15 +166,26 @@ async def _run_correction_attempt(
     attempt: int,
     topology_section: str = "",
     valid_rel_types: set[str] | None = None,
+    topology: "GraphTopology | None" = None,
 ) -> str:
     """Run a single LLM self-correction attempt and return the answer."""
     loop = asyncio.get_running_loop()
+
+    # Compute schema-level errors from the last failed Cypher before building
+    # the correction prompt so the LLM gets structural guidance, not just the
+    # raw Neo4j exception.
+    schema_errors: list[str] | None = None
+    if topology and last_cypher:
+        errs = validate_cypher_schema(last_cypher, topology)
+        schema_errors = errs or None
+
     correction = build_correction_prompt(
         question=question,
         schema=schema,
         failed_cypher=last_cypher or "N/A",
         error=last_error or "unknown error",
         topology_section=topology_section,
+        schema_errors=schema_errors,
     )
 
     resp = await loop.run_in_executor(
@@ -183,6 +206,14 @@ async def _run_correction_attempt(
             raise ValueError(
                 f"Unknown relationship type(s): {', '.join(invalid)}. "
                 f"Valid types: {', '.join(sorted(valid_rel_types))}"
+            )
+
+    if topology:
+        remaining = validate_cypher_schema(corrected_cypher, topology)
+        if remaining:
+            raise ValueError(
+                "Schema violations in corrected Cypher:\n"
+                + "\n".join(f"  - {e}" for e in remaining)
             )
 
     raw = await loop.run_in_executor(
@@ -214,9 +245,10 @@ async def execute_with_retries(
     cypher_prompt: Any = None,
     topology_section: str = "",
     valid_rel_types: set[str] | None = None,
+    topology: "GraphTopology | None" = None,
 ) -> str:
     """Run the Cypher chain, retrying with LLM self-correction on failure."""
-    safety_cb = CypherSafetyCallback(valid_rel_types=valid_rel_types)
+    safety_cb = CypherSafetyCallback(valid_rel_types=valid_rel_types, topology=topology)
 
     last_error: str | None = None
     last_cypher: str | None = None
@@ -243,6 +275,7 @@ async def execute_with_retries(
                 last_cypher, last_error, attempt,
                 topology_section=topology_section,
                 valid_rel_types=valid_rel_types,
+                topology=topology,
             )
         except ReadOnlyViolationError:
             raise
