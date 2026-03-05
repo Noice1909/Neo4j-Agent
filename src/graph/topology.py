@@ -52,6 +52,8 @@ class LabelInfo:
     properties: list[str] = field(default_factory=list)
     display_property: str | None = None  # best property for human-readable returns
     sample_values: dict[str, str] = field(default_factory=dict)
+    description: str = ""                          # from Concept.description
+    nlp_terms: list[str] = field(default_factory=list)  # from Concept.nlp_terms
 
 
 @dataclass
@@ -84,6 +86,11 @@ class GraphTopology:
         return adj
 
     @property
+    def nlp_terms_by_label(self) -> dict[str, list[str]]:
+        """label → nlp_terms list, for labels that have Concept metadata."""
+        return {li.label: li.nlp_terms for li in self.labels if li.nlp_terms}
+
+    @property
     def display_properties(self) -> list[str]:
         """Unique ordered display properties across all labels (for COALESCE)."""
         seen: set[str] = set()
@@ -102,6 +109,16 @@ class GraphTopology:
 
 # ── Cypher helpers ────────────────────────────────────────────────────────────
 
+# Labels that are structural/metadata and must not appear as domain labels.
+_METADATA_LABELS = frozenset({"Concept"})
+
+# COALESCE handles both 'nlp_terms' and older 'nl_terms' property name variant.
+_CONCEPT_QUERY = (
+    "MATCH (n:Concept) "
+    "RETURN n.name AS name, n.description AS description, "
+    "COALESCE(n.nlp_terms, n.nl_terms) AS nlp_terms"
+)
+
 _TRIPLES_QUERY = """\
 MATCH (a)-[r]->(b)
 WHERE labels(a) <> [] AND labels(b) <> []
@@ -116,6 +133,60 @@ RETURN DISTINCT labels(n) AS label_group LIMIT 300
 """
 
 _LABELS_QUERY = "CALL db.labels() YIELD label RETURN label ORDER BY label"
+
+
+def _parse_concept_terms(raw: "str | list | None") -> list[str]:
+    """Parse nlp_terms from a comma-separated string or a list, stripping whitespace."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(t).strip() for t in raw if str(t).strip()]
+    return [t.strip() for t in str(raw).split(",") if t.strip()]
+
+
+async def _fetch_concept_metadata(
+    loop: asyncio.AbstractEventLoop,
+    graph: "Neo4jGraph",
+) -> dict[str, dict]:
+    """
+    Fetch Concept node metadata and return a merged dict keyed by label name.
+
+    Multiple Concept nodes may exist for the same label name — descriptions and
+    nlp_terms are merged (first non-empty description wins; nlp_terms are unioned).
+    Returns ``{}`` on any failure so callers always proceed safely.
+    """
+    try:
+        rows = await loop.run_in_executor(None, graph.query, _CONCEPT_QUERY)
+        meta: dict[str, dict] = {}
+        for row in rows:
+            name = (row.get("name") or "").strip()
+            if not name:
+                continue
+            desc = (row.get("description") or "").strip()
+            terms = _parse_concept_terms(row.get("nlp_terms"))
+            if name not in meta:
+                meta[name] = {"description": desc, "nlp_terms": terms}
+            else:
+                if not meta[name]["description"] and desc:
+                    meta[name]["description"] = desc
+                existing = set(meta[name]["nlp_terms"])
+                meta[name]["nlp_terms"].extend(t for t in terms if t not in existing)
+        logger.info("Concept metadata: loaded %d label definitions.", len(meta))
+        return meta
+    except Exception as exc:
+        logger.warning("Concept metadata fetch failed (non-fatal): %s", exc)
+        return {}
+
+
+def _apply_concept_metadata(label_infos: list[LabelInfo], concept_meta: dict[str, dict]) -> None:
+    """Enrich *label_infos* in-place with description and nlp_terms from Concept nodes."""
+    if not concept_meta:
+        return
+    for li in label_infos:
+        meta = concept_meta.get(li.label, {})
+        li.description = meta.get("description", "")
+        li.nlp_terms = meta.get("nlp_terms") or []
+    logger.info("Topology: enriched %d label(s) with Concept metadata.", len(concept_meta))
 
 
 def _sample_query(label: str) -> str:
@@ -339,7 +410,7 @@ async def extract_topology(graph: "Neo4jGraph") -> GraphTopology:
     label_names: list[str] = []
     try:
         rows = await loop.run_in_executor(None, graph.query, _LABELS_QUERY)
-        label_names = [r["label"] for r in rows if r.get("label")]
+        label_names = [r["label"] for r in rows if r.get("label") and r["label"] not in _METADATA_LABELS]
         logger.info("Topology: found %d node labels.", len(label_names))
     except Exception as exc:
         logger.warning("Topology: label query failed: %s — deriving from triples.", exc)
@@ -352,6 +423,10 @@ async def extract_topology(graph: "Neo4jGraph") -> GraphTopology:
 
     # ── 3. Properties + sample values per label ────────────────────────────────
     label_infos = await _fetch_label_infos(loop, graph, label_names)
+
+    # ── 3b. Concept metadata enrichment ────────────────────────────────────────
+    concept_meta = await _fetch_concept_metadata(loop, graph)
+    _apply_concept_metadata(label_infos, concept_meta)
 
     # ── 4. Multi-hop chain detection ───────────────────────────────────────────
     chains = _find_chains(triples)

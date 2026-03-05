@@ -32,6 +32,7 @@ def init_agent(
     checkpointer: BaseCheckpointSaver,
     *,
     schema_labels: list[str] | None = None,
+    label_descriptions: dict[str, str] | None = None,
     max_conversation_tokens: int = 100_000,
     token_budget_reserve: int = 4096,
 ) -> None:
@@ -64,6 +65,7 @@ def init_agent(
         tools,
         checkpointer,
         schema_labels=schema_labels,
+        label_descriptions=label_descriptions,
         max_conversation_tokens=max_conversation_tokens,
         token_budget_reserve=token_budget_reserve,
     )

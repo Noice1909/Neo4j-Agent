@@ -25,10 +25,35 @@ _coref_re = re.compile(
 # ── Dynamic regex builder ─────────────────────────────────────────────────────
 
 
-def build_coreference_regex(schema_labels: list[str]) -> re.Pattern[str]:
+def _label_tokens(label: str) -> set[str]:
+    """Return regex-escaped token variants for one schema label."""
+    tokens: set[str] = {re.escape(label.lower())}
+    parts = re.findall(r"[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z]|$)", label)
+    if len(parts) > 1:
+        tokens.add(re.escape(" ".join(p.lower() for p in parts)))
+    for p in parts:
+        if len(p) >= 3:
+            tokens.add(re.escape(p.lower()))
+    return tokens
+
+
+def _nlp_tokens(nlp_terms_by_label: dict[str, list[str]]) -> set[str]:
+    """Return regex-escaped tokens from Concept nlp_terms (min 3 chars)."""
+    return {
+        re.escape(term.lower().strip())
+        for terms in nlp_terms_by_label.values()
+        for term in terms
+        if len(term.strip()) >= 3
+    }
+
+
+def build_coreference_regex(
+    schema_labels: list[str],
+    nlp_terms_by_label: dict[str, list[str]] | None = None,
+) -> re.Pattern[str]:
     """
     Build a coreference pattern that includes ``that <label>`` variants for
-    every label in *schema_labels*.
+    every label in *schema_labels*, plus any curated NLP terms from Concept nodes.
 
     CamelCase labels are split so ``SanitizedTable`` also generates
     ``that sanitized table``.  The static trigger phrases are always included.
@@ -37,18 +62,15 @@ def build_coreference_regex(schema_labels: list[str]) -> re.Pattern[str]:
     ----------
     schema_labels:
         Canonical Neo4j node labels from the live schema.
+    nlp_terms_by_label:
+        Optional mapping of label → nlp_terms from ``topology.nlp_terms_by_label``.
+        These terms (e.g. ``"app"``, ``"repo"``) are added as coreference triggers.
     """
     label_tokens: set[str] = set()
     for label in schema_labels:
-        lower = label.lower()
-        label_tokens.add(re.escape(lower))
-        # CamelCase split: "SanitizedTable" → "sanitized", "table", "sanitized table"
-        parts = re.findall(r"[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z]|$)", label)
-        if len(parts) > 1:
-            label_tokens.add(re.escape(" ".join(p.lower() for p in parts)))
-        for p in parts:
-            if len(p) >= 3:
-                label_tokens.add(re.escape(p.lower()))
+        label_tokens |= _label_tokens(label)
+    if nlp_terms_by_label:
+        label_tokens |= _nlp_tokens(nlp_terms_by_label)
 
     if label_tokens:
         that_clause = r"that\s+(?:" + "|".join(sorted(label_tokens)) + r")"

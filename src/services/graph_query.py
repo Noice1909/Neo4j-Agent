@@ -74,6 +74,7 @@ async def run_graph_query(
         id_index_name=settings.entity_id_index_name,
         display_properties=topology.display_properties,
         topology_section=topology_section_full,
+        concept_nlp_terms=topology.nlp_terms_by_label,
     )
     resolved_question = resolution.resolved_question
 

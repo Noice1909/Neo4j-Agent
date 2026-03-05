@@ -42,17 +42,22 @@ logger = logging.getLogger(__name__)
 # ── Graph builder ─────────────────────────────────────────────────────────────
 
 
-def build_system_prompt(schema_labels: list[str]) -> SystemMessage:
+def build_system_prompt(
+    schema_labels: list[str],
+    label_descriptions: dict[str, str] | None = None,
+) -> SystemMessage:
     """
-    Build a domain-agnostic system prompt from live schema label names.
+    Build a domain-agnostic system prompt from live schema label names and
+    optional Concept-node descriptions.
 
     Parameters
     ----------
     schema_labels:
         Canonical Neo4j node labels (e.g. ``["Application", "Domain", "Platform"]``).
+    label_descriptions:
+        Optional mapping of label → description from Concept nodes.
     """
     if schema_labels:
-        # "Application, Domain, Platform, and more"
         sorted_labels = sorted(schema_labels)
         if len(sorted_labels) > 3:
             domain_desc = (
@@ -63,10 +68,21 @@ def build_system_prompt(schema_labels: list[str]) -> SystemMessage:
     else:
         domain_desc = "various entities and their relationships"
 
+    domain_context = ""
+    if label_descriptions:
+        items = [
+            f"{lbl}: {desc}"
+            for lbl, desc in sorted(label_descriptions.items())[:10]
+            if desc
+        ]
+        if items:
+            domain_context = "\nDomain context:\n" + "\n".join(f"- {i}" for i in items) + "\n"
+
     return SystemMessage(content=(
         "You are a helpful and knowledgeable assistant. "
         f"You can answer questions about {domain_desc}. "
-        "You have access to tools that help you find information.\n\n"
+        "You have access to tools that help you find information.\n"
+        f"{domain_context}\n"
         "CRITICAL RULES:\n"
         "- NEVER mention databases, queries, Cypher, Neo4j, graphs, schemas, "
         "nodes, relationships, or any technical implementation details.\n"
@@ -91,6 +107,7 @@ def build_agent_graph(
     checkpointer: BaseCheckpointSaver,
     *,
     schema_labels: list[str] | None = None,
+    label_descriptions: dict[str, str] | None = None,
     max_conversation_tokens: int = 100_000,
     token_budget_reserve: int = 4096,
 ) -> CompiledGraph:  # type: ignore[name-defined]
@@ -123,8 +140,8 @@ def build_agent_graph(
     model_with_tools = llm.bind_tools(tools)
     effective_budget = max(max_conversation_tokens - token_budget_reserve, 1024)
 
-    # System prompt: built dynamically from live schema labels
-    _SYSTEM_PROMPT = build_system_prompt(schema_labels or [])
+    # System prompt: built dynamically from live schema labels + Concept descriptions
+    _SYSTEM_PROMPT = build_system_prompt(schema_labels or [], label_descriptions=label_descriptions)
 
     # ── Nodes ─────────────────────────────────────────────────────────────────────────
 

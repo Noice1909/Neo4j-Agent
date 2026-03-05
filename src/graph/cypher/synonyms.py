@@ -5,7 +5,7 @@ Generates synonyms automatically from live schema labels — nothing is
 hardcoded for any specific domain.  Three layers, highest priority wins:
 
   Layer A — Pattern-based auto-generation (``auto_generate_synonyms``)
-  Layer B — LLM-powered enrichment (``llm_generate_synonyms``, one-time at startup)
+  Layer B — Concept node nlp_terms (domain-expert curated, from Neo4j)
   Layer C — Env-var overrides (``ENTITY_SYNONYM_OVERRIDES`` JSON string)
 
 The synonym map is keyed by **lowercase alias** → **canonical label**.
@@ -15,10 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, Optional
-
-if TYPE_CHECKING:
-    from langchain_core.language_models import BaseChatModel
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -100,76 +97,18 @@ def auto_generate_synonyms(schema_labels: list[str]) -> Dict[str, str]:
     return synonyms
 
 
-# ── LLM-powered enrichment ────────────────────────────────────────────────────
-
-_LLM_SYNONYM_PROMPT = """\
-You are a database assistant. For each Neo4j node label below, list 3-5 short
-natural-language aliases that a non-technical user might type in a chat interface.
-
-Labels: {labels}
-
-Respond with ONLY a JSON object where every key is a lowercase alias and the
-value is the exact label it maps to.  No explanation, no markdown fences.
-Example output: {{"app": "Application", "domain area": "Domain"}}"""
-
-
-async def llm_generate_synonyms(
-    label_names: list[str],
-    llm: "BaseChatModel",
-) -> Dict[str, str]:
-    """
-    Ask the LLM to generate natural-language aliases for each label.
-
-    Called once at startup and cached with the topology.  Returns an empty
-    dict on failure so the caller can always proceed safely.
-
-    Parameters
-    ----------
-    label_names:
-        Canonical Neo4j node labels from the live schema.
-    llm:
-        Any LangChain ``BaseChatModel`` instance.
-    """
-    if not label_names:
-        return {}
-
-    prompt = _LLM_SYNONYM_PROMPT.format(labels=", ".join(label_names))
-    try:
-        response = await llm.ainvoke(prompt)
-        raw: str = str(response.content) if hasattr(response, "content") else str(response)
-
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"```[a-z]*\n?", "", raw).strip("` \n")
-
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("Expected a JSON object.")
-
-        result: Dict[str, str] = {
-            k.lower().strip(): str(v)
-            for k, v in parsed.items()
-            if isinstance(v, str)
-        }
-        logger.info("LLM synonym enrichment: %d aliases generated.", len(result))
-        return result
-    except Exception as exc:
-        logger.warning("LLM synonym enrichment failed (non-fatal): %s", exc)
-        return {}
-
-
 # ── Final map builder ──────────────────────────────────────────────────────────
 
 
 def build_synonym_map(
     schema_labels: list[str],
     overrides_json: Optional[str] = None,
-    llm_synonyms: Optional[Dict[str, str]] = None,
+    concept_nlp_terms: Optional[Dict[str, list[str]]] = None,
 ) -> Dict[str, str]:
     """
     Build the final synonym map by merging all three layers.
 
-    Priority (highest wins): env-var overrides > LLM-generated > pattern-based.
+    Priority (highest wins): env-var overrides > Concept nlp_terms > pattern-based.
 
     Parameters
     ----------
@@ -178,8 +117,8 @@ def build_synonym_map(
     overrides_json:
         Optional JSON string of custom synonym overrides
         (``ENTITY_SYNONYM_OVERRIDES`` env var).
-    llm_synonyms:
-        Pre-generated LLM synonyms dict (from ``llm_generate_synonyms``).
+    concept_nlp_terms:
+        Per-label nlp_terms from Concept nodes (``topology.nlp_terms_by_label``).
 
     Returns
     -------
@@ -189,13 +128,14 @@ def build_synonym_map(
     # Layer A: pattern-based
     result: Dict[str, str] = auto_generate_synonyms(schema_labels)
 
-    # Layer B: LLM-generated (only accepted for known labels)
-    if llm_synonyms:
+    # Layer B: Concept node nlp_terms (domain-expert curated)
+    if concept_nlp_terms:
         valid_labels = set(schema_labels)
-        for alias, label in llm_synonyms.items():
+        for label, terms in concept_nlp_terms.items():
             if label in valid_labels:
-                result[alias.lower()] = label
-        logger.debug("Applied %d LLM-generated synonyms.", len(llm_synonyms))
+                for term in terms:
+                    result[term.lower().strip()] = label
+        logger.debug("Applied Concept nlp_terms as synonyms.")
 
     # Layer C: env-var overrides (highest priority, no label validation)
     if overrides_json:

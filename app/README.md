@@ -50,13 +50,13 @@ app/
 │       ├── retry.py               # Tenacity retry + topology-enriched self-correction
 │       ├── coreference.py         # Pronoun/coreference resolution (dynamic regex)
 │       ├── callback.py            # CypherSafetyCallback (safety + rel-type validation)
-│       ├── synonyms.py            # Auto-generated synonyms (pattern + LLM enrichment)
-│       └── entity_resolution/     # 3-layer entity resolution pipeline
+│       ├── synonyms.py            # Auto-generated synonyms (pattern-based + Concept nlp_terms)
+│       └── entity_resolution/     # 4-layer entity resolution pipeline
 │           ├── models.py          # Correction / ResolutionResult data classes
 │           ├── capabilities.py    # Neo4j capability probes (index, APOC)
 │           ├── label_resolver.py  # Layer 1: schema-aware label matching
 │           ├── name_resolver.py   # Layer 2: full-text + APOC DB lookups (dynamic COALESCE)
-│           └── orchestrator.py    # Layer 3 (LLM) + pipeline orchestrator
+│           └── orchestrator.py    # Layer 0.5 (Concept FT) + Layer 3 (LLM) + pipeline orchestrator
 ├── llm/
 │   └── factory.py                 # Ollama LLM factory
 └── mcp/
@@ -79,7 +79,8 @@ app/
 | **Redis** | Session persistence (checkpointer) + schema/topology cache + query dedup cache — multi-worker safe |
 | **Ollama** | Local LLM inference (default: `qwen2.5:latest`) |
 | **Query Dedup** | Two-layer deduplication: Redis response cache + in-flight coalescing |
-| **Entity Resolution** | 3-layer pipeline: auto-synonym matching → APOC fuzzy → LLM fallback (topology-enriched) |
+| **Entity Resolution** | 4-layer pipeline: Concept FT semantic → label synonyms → APOC fuzzy → LLM fallback (topology-enriched) |
+| **Concept Nodes** | Domain metadata (description, nlp_terms) enriches synonyms, coreference regex, prompts, and system context |
 | **FastMCP** | Model Context Protocol server mounted at `/mcp` |
 | **Prometheus** | Metrics endpoint at `/metrics` |
 
@@ -106,18 +107,19 @@ The application derives all domain-specific configuration from the live Neo4j sc
       • (A)-[:REL]->(B) relationship triples
       • APOC meta enrichment: relationship counts + bidirectionality (graceful fallback)
       • Multi-hop chains (DFS, max depth 5, max 40 chains)
-[2c] Dynamic coreference regex built from schema labels
-      e.g. "that application|domain|platform|..." replaces hardcoded movie/actor
+      • Concept metadata enrichment: description + nlp_terms per label (from Concept nodes)
+[2c] Dynamic coreference regex built from schema labels + Concept nlp_terms tokens
+      e.g. "that application|app|domain|platform|..." covers label names and curated synonyms
 [3]  LangGraph checkpointer (Redis)
 [4]  LLM response cache (Redis)
 [4b] Query deduplicator (Redis-backed)
 [5]  LLM instance created
-[5b] LLM synonym enrichment
-      • Pattern-based: CamelCase splits, acronyms, abbreviations
-      • LLM-generated: 3-5 natural aliases per label (cached with topology)
-      • Env-var overrides (highest priority)
+[5b] Concept-based synonym enrichment (no LLM call needed)
+      • Layer A — Pattern-based: CamelCase splits, acronyms, abbreviations
+      • Layer B — Concept nlp_terms: domain-curated terms from Concept nodes
+      • Layer C — Env-var overrides (highest priority)
 [6]  LangGraph agent compiled
-      • System prompt built from topology.label_names (domain-agnostic)
+      • System prompt built from topology.label_names + Concept descriptions as domain context
       • e.g. "You can answer questions about Application, Domain, Platform, and 4 more"
 [7]  FastMCP tools registered
 [8]  Ready
@@ -134,8 +136,10 @@ Client → FastAPI → APIKeyMiddleware → RateLimiter
       → Coreference Resolution
           Dynamic regex built from topology labels at startup
       → Entity Resolution Pipeline
+        → Layer 0.5: Concept FT semantic label resolution
+            concept_name_description_ft index maps vague terms to canonical labels
         → Layer 1: Label/category correction
-            Auto-generated synonyms (pattern + LLM) + fuzzy match
+            Auto-generated synonyms (pattern-based + Concept nlp_terms) + fuzzy match
         → Layer 2a: Full-text index lookup (if admin-created)
         → Layer 2b: APOC multi-signal (Levenshtein + Sørensen-Dice + Jaro-Winkler)
         → Layer 2c: APOC phonetic (doubleMetaphone)
@@ -170,6 +174,7 @@ sequenceDiagram
     participant QD as QueryDeduplicator (Redis)
     participant CR as Coreference Resolver
     participant ER as Entity Resolution
+    participant L05 as Layer 0.5: Concept FT
     participant L1 as Layer 1: Label Resolver
     participant L2 as Layer 2: Name Resolver
     participant L3 as Layer 3: LLM Fallback
@@ -179,7 +184,7 @@ sequenceDiagram
     participant LLM as LLM (Ollama)
     participant Redis as Redis
 
-    Note over API: Startup: topology extracted, regex/synonyms/prompt built from live schema → cached in Redis
+    Note over API: Startup: topology + Concept metadata extracted, regex/synonyms/prompt built from live schema → cached in Redis
 
     C->>API: POST /chat {message, session_id}
     API->>QD: Check Redis cache / in-flight
@@ -187,12 +192,17 @@ sequenceDiagram
         QD-->>API: Cached response (Redis)
         API-->>C: JSON response
     else Cache Miss
-        QD->>CR: Resolve coreferences (dynamic schema-label regex)
+        QD->>CR: Resolve coreferences (schema-label regex + Concept nlp_terms tokens)
         CR->>LLM: Resolve pronouns from history
         CR-->>QD: Resolved question
-        QD->>ER: resolve_entities(question, schema, topology_section)
+        QD->>ER: resolve_entities(question, schema, topology_section, concept_nlp_terms)
 
-        ER->>L1: Auto-generated synonym map + fuzzy match
+        ER->>L05: concept_name_description_ft semantic lookup
+        L05->>Neo4j: Full-text query for vague term → canonical label
+        Neo4j-->>L05: Matched label name
+        L05-->>ER: Concept FT corrections (if any)
+
+        ER->>L1: Concept nlp_terms synonym map + fuzzy match
         L1-->>ER: Label corrections (if any)
 
         alt Full-text index exists
@@ -221,7 +231,7 @@ sequenceDiagram
         ER-->>QD: Corrected question
         QD->>AG: invoke(messages, thread_id)
         Note over AG: Load full history from Redis checkpoint
-        Note over AG: Dynamic system prompt (built from live schema labels)
+        Note over AG: Dynamic system prompt (schema labels + Concept descriptions as domain context)
         AG->>TM: trim_conversation(messages, budget)
         Note over TM: Pin: SystemPrompt + 1st HumanMessage
         Note over TM: Fill: newest messages within budget
@@ -401,10 +411,11 @@ curl http://localhost:8000/health/ready
 - **Query-aware topology filtering** — Narrows full schema to labels mentioned in the question + one-hop neighbours before building the Cypher prompt; reduces noise and keeps the LLM focused
 - **Auto-generated Cypher prompts** — Up to 15 few-shot patterns auto-built from filtered topology with real sample values; question-relevant triples prioritised; relationship-type validation blocks hallucinated types
 - **APOC meta enrichment** — Relationship counts and bidirectionality annotations added to topology at startup; graceful fallback if APOC is unavailable; cached in Redis with topology
-- **LLM synonym enrichment** — 3-5 natural aliases per label generated by the LLM at startup; merged with pattern-based synonyms and env-var overrides
+- **Concept node metadata enrichment** — `Concept` nodes in Neo4j carry `description`, `nlp_terms`, and `sample_values` per domain label; loaded at topology extraction and enriches every pipeline layer
+- **Concept-node synonym enrichment** — Curated `nlp_terms` from `Concept` nodes replace LLM-generated synonyms; merged with pattern-based synonyms and env-var overrides — no extra LLM call at startup
 - **Context window management** — Token-based sliding window trims history before each LLM call; pins system prompt + topic anchor; configurable budget via env vars
 - **Query deduplication** — Two-layer dedup reduces redundant LLM calls (Redis response cache + in-flight coalescing)
-- **Dynamic entity resolution** — 3-layer pipeline corrects typos, wrong labels, and ambiguous names before Cypher generation; topology context enriches LLM fallback
+- **Dynamic entity resolution** — 4-layer pipeline: Concept FT semantic lookup → label synonym matching → APOC fuzzy → LLM fallback; all layers enriched with Concept metadata
 - **Topology-enriched retry** — Self-correction prompts include the full topology section and universal Cypher rules for better correction quality
 - **Read-only Neo4j compatible** — No write operations; works with read-only accounts on 3M+ node databases
 - **APOC-powered fuzzy matching** — Levenshtein + Sørensen-Dice + Jaro-Winkler + phonetic matching
@@ -429,7 +440,8 @@ The entity resolution pipeline automatically corrects user queries before Cypher
 
 | Layer | Strategy | Latency | How It Works |
 |---|---|---|---|
-| **1 — Label** | Auto-generated synonyms + fuzzy matching | < 1 ms | Pattern-based synonyms (CamelCase, acronym, words) + LLM-enriched aliases — all derived from live labels |
+| **0.5 — Concept FT** | Full-text index semantic lookup | ~ 1 ms | Queries `concept_name_description_ft` to map vague terms to canonical label names — runs before fuzzy matching |
+| **1 — Label** | Auto-generated synonyms + fuzzy matching | < 1 ms | Pattern-based synonyms (CamelCase, acronym, words) + Concept nlp_terms — all derived from live labels and Concept nodes |
 | **2a — Full-text** | Lucene index (admin-created) | ~ 1 ms | Dynamic `COALESCE` over detected display properties |
 | **2b — APOC Multi-signal** | Levenshtein + Sørensen-Dice + Jaro-Winkler | 50-500 ms | Label-scoped queries using three averaged similarity metrics |
 | **2c — APOC Phonetic** | `doubleMetaphone` matching | 50-500 ms | Sound-alike matching for phonetically similar names |
@@ -440,7 +452,7 @@ The entity resolution pipeline automatically corrects user queries before Cypher
 | Priority | Source | Description |
 |---|---|---|
 | Highest | `ENTITY_SYNONYM_OVERRIDES` env var | Manual JSON overrides for edge cases |
-| Middle | LLM-generated | 3-5 natural aliases per label, generated once at startup, cached |
+| Middle | Concept `nlp_terms` | Domain-curated synonyms from `Concept` nodes in Neo4j — loaded at startup with topology |
 | Base | Pattern-based | CamelCase splits, acronyms, abbreviations, underscore forms, individual words |
 
 ### Admin Setup (Optional, Recommended)
@@ -453,6 +465,15 @@ FOR (n) ON EACH [n.name, n.title]
 ```
 
 The app detects and uses this index automatically. Without it, the APOC fallback is used.
+
+For Layer 0.5 semantic label resolution, create the Concept full-text index:
+
+```cypher
+CREATE FULLTEXT INDEX concept_name_description_ft IF NOT EXISTS
+FOR (n:Concept) ON EACH [n.name, n.description]
+```
+
+This enables the entity resolution pipeline to map vague user terms (e.g. "data product", "app") to canonical label names before fuzzy matching runs.
 
 ---
 

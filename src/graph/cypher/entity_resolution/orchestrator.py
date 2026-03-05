@@ -119,6 +119,31 @@ async def _run_llm_fallback(
         return current_question, []
 
 
+# ── Layer 0.5: Concept full-text label resolution ────────────────────────────
+
+_CONCEPT_FT_QUERY = (
+    "CALL db.index.fulltext.queryNodes('concept_name_description_ft', $term) "
+    "YIELD node, score WHERE score >= $min_score "
+    "RETURN node.name AS label ORDER BY score DESC LIMIT 1"
+)
+
+
+async def _concept_ft_label_resolve(
+    term: str,
+    graph: Any,
+    loop: asyncio.AbstractEventLoop,
+    min_score: float = 1.0,
+) -> str | None:
+    """Query concept_name_description_ft to semantically map a term to a label name."""
+    try:
+        rows = await loop.run_in_executor(
+            None, graph.query, _CONCEPT_FT_QUERY, {"term": term, "min_score": min_score},
+        )
+        return rows[0]["label"] if rows else None
+    except Exception:
+        return None
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 
@@ -136,9 +161,10 @@ async def resolve_entities(
     id_index_name: str = FULLTEXT_ID_INDEX_NAME,
     display_properties: list[str] | None = None,
     topology_section: str = "",
+    concept_nlp_terms: dict[str, list[str]] | None = None,
 ) -> ResolutionResult:
     """
-    Run the 3-layer entity resolution pipeline.
+    Run the entity resolution pipeline (Layer 0.5 + Layers 1-3).
 
     Parameters
     ----------
@@ -158,6 +184,9 @@ async def resolve_entities(
         JSON string of custom synonym overrides.
     max_candidates:
         Max candidates to fetch from Neo4j for name lookups.
+    concept_nlp_terms:
+        Per-label nlp_terms from Concept nodes (``topology.nlp_terms_by_label``).
+        Used in LabelResolver synonym map and Layer 0.5 FT label resolution.
     """
     if not enabled:
         return ResolutionResult(
@@ -165,9 +194,29 @@ async def resolve_entities(
             resolved_question=question,
         )
 
+    loop = asyncio.get_running_loop()
     all_corrections: list[Correction] = []
     current_question = question
     label_resolver: LabelResolver | None = None
+
+    # ── Layer 0.5: Concept FT semantic label resolution ──────────────────
+    try:
+        for word in set(current_question.split()):
+            candidate = word.strip("?.,!").lower()
+            if len(candidate) >= 4:
+                matched = await _concept_ft_label_resolve(candidate, graph, loop)
+                if matched and matched.lower() != candidate:
+                    current_question = current_question.replace(word, matched)
+                    all_corrections.append(Correction(
+                        original=word,
+                        corrected=matched,
+                        layer="concept_ft",
+                        confidence=1.0,
+                    ))
+        _log_layer_result("ENTITY_RES_L05", "Layer 0.5 (concept FT)", all_corrections, "No concept FT corrections")
+    except Exception as exc:
+        logger.warning("Layer 0.5 (concept FT) resolution failed: %s", exc)
+        trace_event("ENTITY_RES_L05", "fail", str(exc)[:80])
 
     # ── Layer 1: Label resolution ────────────────────────────────────────
     try:
@@ -175,6 +224,7 @@ async def resolve_entities(
             schema=schema,
             synonym_overrides=synonym_overrides,
             fuzzy_threshold=fuzzy_threshold,
+            concept_nlp_terms=concept_nlp_terms,
         )
         current_question, label_corrections = label_resolver.resolve(
             current_question,

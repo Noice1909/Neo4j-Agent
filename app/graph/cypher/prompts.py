@@ -158,11 +158,13 @@ def _chain_lines(topology: "GraphTopology") -> list[str]:
 
 def _prop_lines(topology: "GraphTopology") -> list[str]:
     """Render the per-label property hints block (empty list if none)."""
-    entries = [
-        f"  {li.label}: {', '.join(li.properties[:8])}"
-        for li in topology.labels
-        if len(li.properties) > 1
-    ]
+    entries: list[str] = []
+    for li in topology.labels:
+        if len(li.properties) > 1:
+            line = f"  {li.label}: {', '.join(li.properties[:8])}"
+            if li.description:
+                line += f"  # {li.description}"
+            entries.append(line)
     if not entries:
         return []
     return [

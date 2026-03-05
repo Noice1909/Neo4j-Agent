@@ -30,11 +30,14 @@ class LabelResolver:
         schema: str,
         synonym_overrides: str = "",
         fuzzy_threshold: float = 0.75,
+        concept_nlp_terms: dict[str, list[str]] | None = None,
     ) -> None:
         self._labels = self._extract_labels(schema)
         self._rel_types = self._extract_relationship_types(schema)
         self._all_types = self._labels + self._rel_types
-        self._synonym_map = build_synonym_map(self._labels, synonym_overrides)
+        self._synonym_map = build_synonym_map(
+            self._labels, synonym_overrides, concept_nlp_terms=concept_nlp_terms,
+        )
         self._fuzzy_threshold = fuzzy_threshold
 
     @staticmethod

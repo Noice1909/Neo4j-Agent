@@ -52,7 +52,7 @@ from src.core.exception_handlers import (
 )
 from src.graph.connection import close_graph, init_graph
 from src.graph.cypher.coreference import build_coreference_regex, set_coreference_regex
-from src.graph.cypher.synonyms import llm_generate_synonyms
+
 from src.graph.schema_cache import SchemaCache
 from src.llm.factory import get_llm_from_settings
 from src.mcp.server import mcp, register_all_tools
@@ -113,7 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ── 2c. Build dynamic coreference regex from schema labels ────────────────
-    set_coreference_regex(build_coreference_regex(topology.label_names))
+    set_coreference_regex(build_coreference_regex(topology.label_names, nlp_terms_by_label=topology.nlp_terms_by_label))
     logger.info("Coreference regex updated for %d labels.", len(topology.label_names))
 
     # ── 3. LangGraph checkpointer (SQLite / Redis / Memory) ──────────────────
@@ -158,15 +158,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         build_vector_search_tool(llm),
     ]
 
-    # ── 5b. LLM-powered synonym enrichment (needs LLM — runs after step 5) ───
-    logger.info("[5b] Generating LLM synonym enrichment...")
-    import json as _json
-    llm_synonyms = await llm_generate_synonyms(topology.label_names, llm)
-    if llm_synonyms:
-        merged = _json.loads(settings.entity_synonym_overrides or "{}")
-        merged.update(llm_synonyms)
-        settings.entity_synonym_overrides = _json.dumps(merged)
-        logger.info("LLM synonyms merged: %d aliases.", len(llm_synonyms))
+    # ── 5b. Concept-based synonym enrichment (no LLM call needed) ───────────
+    logger.info("[5b] Synonym enrichment via Concept nodes: %d labels covered.", len(topology.nlp_terms_by_label))
 
     # ── 6. Compile LangGraph agent ────────────────────────────────────────────
     logger.info("[6/8] Compiling LangGraph agent...")
@@ -176,6 +169,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tools=tools,
         checkpointer=get_checkpointer(),
         schema_labels=topology.label_names,
+        label_descriptions={li.label: li.description for li in topology.labels if li.description},
         max_conversation_tokens=settings.max_conversation_tokens,
         token_budget_reserve=settings.token_budget_reserve,
     )
