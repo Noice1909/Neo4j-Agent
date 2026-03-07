@@ -1,43 +1,91 @@
 """
-In-memory TTL-based Neo4j schema cache.
+TTL-based Neo4j schema cache — supports in-memory and Redis backends.
 
 Why cache the schema?
 ─────────────────────
 Every `GraphCypherQAChain` call injects the full graph schema into the prompt.
 Calling `Neo4jGraph.refresh_schema()` (which hits the DB) on every request is
-expensive and unnecessary.  This module stores the schema in an in-memory dict
-with a configurable TTL, so the schema is only fetched when it expires.
+expensive and unnecessary.  This module stores the schema with a configurable
+TTL, so the schema is only fetched when it expires.
+
+Backend selection:
+──────────────────
+- **redis_client=None** (default): In-memory dict with monotonic timestamps.
+  Fully self-contained, no external dependencies.
+- **redis_client=<Redis>**: Redis-backed with Redis-native TTL.  All workers
+  share a single cached schema.  In-memory fallback for topology on Redis
+  failure.
 
 Schema-change flow:
 ───────────────────
-1. At app startup, the schema is fetched and stored in memory.
+1. At app startup, the schema is fetched and stored.
 2. On cache miss (TTL expired), the schema is re-fetched.
 3. `invalidate()` is provided for manual invalidation (e.g.
    after a known schema migration) — call it from an admin endpoint.
 4. A background proactive-refresh task fires at 80 % of the TTL so there is
    never a cold-start delay during normal operation.
-
-This implementation does NOT require Redis — it is fully self-contained.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import TYPE_CHECKING
 
 from src.core.exceptions import SchemaUnavailableError
-from src.graph.topology import GraphTopology, extract_topology
+from src.graph.topology import GraphTopology, LabelInfo, RelationshipTriple, extract_topology
 
 if TYPE_CHECKING:
+    import redis.asyncio as aioredis
     from langchain_neo4j import Neo4jGraph
 
 logger = logging.getLogger(__name__)
 
+# Redis key names (only used when redis_client is provided)
+_SCHEMA_REDIS_KEY = "neo4j:schema"
+_TOPOLOGY_REDIS_KEY = "neo4j:topology"
+
+
+# ── Topology serialization helpers (Redis mode) ─────────────────────────────
+
+def _topology_to_json(topology: GraphTopology) -> str:
+    return json.dumps({
+        "labels": [
+            {
+                "label": li.label,
+                "properties": li.properties,
+                "display_property": li.display_property,
+                "sample_values": li.sample_values,
+            }
+            for li in topology.labels
+        ],
+        "triples": [
+            {"source_label": t.source_label, "rel_type": t.rel_type, "target_label": t.target_label}
+            for t in topology.triples
+        ],
+        "chains": [
+            [{"source_label": t.source_label, "rel_type": t.rel_type, "target_label": t.target_label}
+             for t in chain]
+            for chain in topology.chains
+        ],
+    })
+
+
+def _topology_from_json(raw: str) -> GraphTopology:
+    data = json.loads(raw)
+    labels = [LabelInfo(**li) for li in data["labels"]]
+    triples = [RelationshipTriple(**t) for t in data["triples"]]
+    chains = [[RelationshipTriple(**t) for t in chain] for chain in data["chains"]]
+    return GraphTopology(labels=labels, triples=triples, chains=chains)
+
 
 class SchemaCache:
     """
-    Async in-memory cache for the Neo4j graph schema string with TTL expiry.
+    Async cache for the Neo4j graph schema string with TTL expiry.
+
+    When ``redis_client`` is provided, schema and topology are stored in
+    Redis (shared across workers).  Otherwise, everything stays in-process.
 
     Parameters
     ----------
@@ -45,15 +93,20 @@ class SchemaCache:
         The ``Neo4jGraph`` instance used to re-fetch schema on miss.
     ttl_seconds:
         Cache TTL; schema is considered stale after this many seconds.
+    redis_client:
+        Optional async Redis client.  ``None`` = in-memory mode.
     """
 
     def __init__(
         self,
         graph: "Neo4jGraph",
         ttl_seconds: int = 300,
+        redis_client: "aioredis.Redis | None" = None,
     ) -> None:
         self._graph = graph
         self._ttl = ttl_seconds
+        self._redis = redis_client
+        # In-memory state (primary when no Redis; fallback when Redis fails)
         self._cached_schema: str | None = None
         self._cached_at: float = 0.0  # monotonic timestamp
         self._cached_topology: GraphTopology | None = None
@@ -70,8 +123,16 @@ class SchemaCache:
         SchemaUnavailableError
             If Neo4j is unreachable.
         """
-        if self._cached_schema and (time.monotonic() - self._cached_at) < self._ttl:
-            return self._cached_schema
+        if self._redis is not None:
+            try:
+                cached = await self._redis.get(_SCHEMA_REDIS_KEY)
+                if cached:
+                    return cached.decode() if isinstance(cached, bytes) else cached
+            except Exception as exc:
+                logger.warning("Redis schema cache read failed: %s", exc)
+        else:
+            if self._cached_schema and (time.monotonic() - self._cached_at) < self._ttl:
+                return self._cached_schema
 
         return await self._fetch_and_cache()
 
@@ -87,25 +148,43 @@ class SchemaCache:
 
         The topology is refreshed on the same cycle as the schema (same TTL).
         """
-        if self._cached_topology is not None and (
-            time.monotonic() - self._cached_at
-        ) < self._ttl:
+        if self._redis is not None:
+            try:
+                raw = await self._redis.get(_TOPOLOGY_REDIS_KEY)
+                if raw:
+                    return _topology_from_json(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception as exc:
+                logger.warning("Redis topology cache read failed: %s", exc)
+        else:
+            if self._cached_topology is not None and (
+                time.monotonic() - self._cached_at
+            ) < self._ttl:
+                return self._cached_topology
+
+        # In-memory fallback (topology may still be in memory from last refresh)
+        if self._cached_topology is not None:
             return self._cached_topology
 
-        # Trigger a full refresh (schema + topology)
+        # Extract fresh (also caches it)
         await self._fetch_and_cache()
         if self._cached_topology is None:
-            # extract_topology failed; return empty topology so callers don't crash
             logger.warning("Topology unavailable — returning empty topology.")
             return GraphTopology()
         return self._cached_topology
 
     async def invalidate(self) -> None:
-        """Clear the cached schema and topology so the next call re-fetches from Neo4j."""
+        """Clear the cached schema and topology so the next call re-fetches."""
+        if self._redis is not None:
+            try:
+                await self._redis.delete(_SCHEMA_REDIS_KEY, _TOPOLOGY_REDIS_KEY)
+                logger.info("Schema cache invalidated (Redis).")
+            except Exception as exc:
+                logger.warning("Failed to invalidate schema cache in Redis: %s", exc)
+        else:
+            logger.info("Schema cache invalidated.")
         self._cached_schema = None
         self._cached_at = 0.0
         self._cached_topology = None
-        logger.info("Schema cache invalidated.")
 
     async def stop_refresh_task(self) -> None:
         """Cancel the background proactive-refresh task (call at shutdown)."""
@@ -120,7 +199,7 @@ class SchemaCache:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _fetch_and_cache(self) -> str:
-        """Fetch schema from Neo4j, store in memory, and return it."""
+        """Fetch schema from Neo4j, store in cache, and return it."""
         try:
             loop = asyncio.get_running_loop()
             # Neo4jGraph.refresh_schema() is synchronous — run in thread pool.
@@ -134,17 +213,44 @@ class SchemaCache:
             logger.error("Failed to fetch Neo4j schema: %s", exc)
             raise SchemaUnavailableError(str(exc)) from exc
 
+        # Always store in memory (primary or fallback)
         self._cached_schema = schema
         self._cached_at = time.monotonic()
-        logger.info(
-            "Schema fetched from Neo4j and cached in memory (TTL=%ds, %d chars).",
-            self._ttl,
-            len(schema),
-        )
+
+        # Store in Redis (best-effort)
+        if self._redis is not None:
+            try:
+                await self._redis.setex(_SCHEMA_REDIS_KEY, self._ttl, schema)
+                logger.info(
+                    "Schema fetched from Neo4j and cached in Redis (TTL=%ds, %d chars).",
+                    self._ttl, len(schema),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Redis unavailable — schema cached in memory only (%d chars). Error: %s",
+                    len(schema), exc,
+                )
+        else:
+            logger.info(
+                "Schema fetched from Neo4j and cached in memory (TTL=%ds, %d chars).",
+                self._ttl, len(schema),
+            )
 
         # Extract and cache topology on every schema refresh
         try:
-            self._cached_topology = await extract_topology(self._graph)
+            topology = await extract_topology(self._graph)
+            self._cached_topology = topology
+            if self._redis is not None:
+                try:
+                    await self._redis.setex(
+                        _TOPOLOGY_REDIS_KEY, self._ttl, _topology_to_json(topology),
+                    )
+                    logger.info(
+                        "Topology cached in Redis (%d labels, %d triples).",
+                        len(topology.labels), len(topology.triples),
+                    )
+                except Exception as exc:
+                    logger.warning("Redis topology write failed (in-memory fallback): %s", exc)
         except Exception as exc:
             logger.warning("Topology extraction failed (non-fatal): %s", exc)
 
@@ -165,4 +271,3 @@ class SchemaCache:
 
         self._refresh_task = asyncio.create_task(_loop())
         logger.info("Schema proactive refresh scheduled every %d seconds.", delay)
-

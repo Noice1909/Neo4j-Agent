@@ -1,17 +1,24 @@
 """
-Query deduplication service — SQLite / no-Redis variant.
+Query deduplication service — supports in-memory and Redis backends.
 
 Two-layer strategy to reduce redundant LLM calls:
 
 **Layer 1 — Response Cache (Case 1: already answered)**
-    Caches agent-level responses in an in-memory TTL dict, keyed by
-    normalised query text (not session-specific prompt).
+    Caches agent-level responses keyed by normalised query text
+    (not session-specific prompt).  Backend is either an in-memory TTL dict
+    or Redis, depending on whether a ``redis_client`` is provided.
 
 **Layer 2 — In-Flight Coalescing (Case 2: concurrent duplicates)**
     Uses ``asyncio.Future`` objects so concurrent identical queries share
     a single agent invocation.  Process-local (asyncio is single-threaded).
 
-This implementation does NOT require Redis — it is fully self-contained.
+Normalisation pipeline:
+    1. Unicode NFKC + lowercase
+    2. Punctuation strip
+    3. Whitespace collapse
+    4. Stopword removal
+    5. Token sort (word-order-independent)
+    6. SHA-256 hash → fixed-length cache key
 """
 from __future__ import annotations
 
@@ -22,7 +29,10 @@ import logging
 import re
 import time
 import unicodedata
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
 
@@ -117,13 +127,21 @@ class _TTLCache:
         self._store[key] = (now + self._ttl, value)
 
 
+# ── Redis cache key prefix ──────────────────────────────────────────────────
+
+_CACHE_PREFIX = "query_dedup:"
+
+
 # ── QueryDeduplicator ────────────────────────────────────────────────────────
 
 
 class QueryDeduplicator:
     """
-    Two-layer query deduplication backed by in-memory TTL cache (Layer 1)
-    and asyncio (Layer 2).
+    Two-layer query deduplication.
+
+    Layer 1 uses either Redis or an in-memory TTL cache depending on whether
+    a ``redis_client`` is provided.  Layer 2 (in-flight coalescing) is always
+    process-local.
 
     Parameters
     ----------
@@ -132,7 +150,9 @@ class QueryDeduplicator:
     enabled:
         Master switch — when ``False``, all calls pass straight through.
     max_cache_size:
-        Maximum number of cached responses (LRU-style eviction on overflow).
+        Maximum number of cached responses in memory (ignored in Redis mode).
+    redis_client:
+        Optional async Redis client.  ``None`` = in-memory mode.
     """
 
     def __init__(
@@ -140,7 +160,10 @@ class QueryDeduplicator:
         ttl_seconds: int = 1800,
         enabled: bool = True,
         max_cache_size: int = 2048,
+        redis_client: "aioredis.Redis | None" = None,
     ) -> None:
+        self._redis = redis_client
+        self._ttl = ttl_seconds
         self._cache = _TTLCache(ttl_seconds=ttl_seconds, max_size=max_cache_size)
         self._enabled = enabled
         # Layer 2: in-flight futures (process-local)
@@ -181,15 +204,15 @@ class QueryDeduplicator:
 
         key = normalize_query(query)
 
-        # ── Layer 1: in-memory response cache ─────────────────────────────
-        cached = self._cache.get(key)
+        # ── Layer 1: response cache ──────────────────────────────────────
+        cached = await self._get_cached(key)
         if cached is not None:
             logger.info("Query dedup CACHE HIT (key=%s…)", key[:12])
             from src.core.tracing import trace_event
             trace_event("DEDUP_CHECK", "ok", "CACHE HIT")
             return cached
 
-        # ── Layer 2: in-flight coalescing ─────────────────────────────────
+        # ── Layer 2: in-flight coalescing ────────────────────────────────
         existing_future: asyncio.Future[dict[str, Any]] | None = None
         future: asyncio.Future[dict[str, Any]] | None = None
         async with self._lock:
@@ -222,7 +245,7 @@ class QueryDeduplicator:
             payload = self._build_payload(result)
             # Store in cache
             if payload is not None:
-                self._cache.set(key, payload)
+                await self._store_cached(key, payload)
 
             # Resolve the future so joiners receive the same payload
             if not future.done():
@@ -260,3 +283,31 @@ class QueryDeduplicator:
         if hasattr(last_msg, "usage_metadata") and last_msg.usage_metadata:
             payload["tokens_used"] = last_msg.usage_metadata.get("total_tokens")
         return payload
+
+    async def _get_cached(self, key: str) -> dict[str, Any] | None:
+        """Retrieve a cached response (Redis or in-memory)."""
+        if self._redis is not None:
+            try:
+                raw = await self._redis.get(f"{_CACHE_PREFIX}{key}")
+                if raw is None:
+                    return None
+                return json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            except Exception as exc:
+                logger.warning("Query dedup cache read failed: %s", exc)
+                return None
+        else:
+            return self._cache.get(key)
+
+    async def _store_cached(self, key: str, payload: dict[str, Any]) -> None:
+        """Store a serialised payload (Redis or in-memory)."""
+        if self._redis is not None:
+            try:
+                await self._redis.setex(
+                    f"{_CACHE_PREFIX}{key}",
+                    self._ttl,
+                    json.dumps(payload),
+                )
+            except Exception as exc:
+                logger.warning("Query dedup cache write failed: %s", exc)
+        else:
+            self._cache.set(key, payload)

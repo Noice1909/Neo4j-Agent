@@ -72,6 +72,7 @@ services:
     environment:
       NEO4J_URI: bolt://neo4j:7687
       REDIS_URL: redis://redis:6379
+      CACHE_BACKEND: redis
       OLLAMA_BASE_URL: http://ollama:11434
     depends_on:
       neo4j:

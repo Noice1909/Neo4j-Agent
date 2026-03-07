@@ -44,8 +44,19 @@ class Settings(BaseSettings):
     # Tokens reserved for model output (subtracted from budget).
     token_budget_reserve: int = 4096
 
-    # ── Redis (optional — only used when checkpointer_backend="redis") ────────
+    # ── Redis (optional — only used when cache_backend="redis") ─────────────
     redis_url: str = "redis://localhost:6379"
+
+    # ── Cache / State Backend ─────────────────────────────────────────────────
+    # "redis"  — Redis for schema cache, LLM cache, query dedup, checkpointer
+    #            (multi-worker safe, requires Redis running)
+    # "memory" — In-memory caches + SQLite checkpointer (single-process, no Redis)
+    cache_backend: str = "memory"
+
+    @property
+    def use_redis(self) -> bool:
+        """Whether Redis-backed caching is enabled."""
+        return self.cache_backend.lower().strip() == "redis"
 
     # ── Checkpointer ─────────────────────────────────────────────────────────
     # Backend: "sqlite" (default, persistent, single-process),

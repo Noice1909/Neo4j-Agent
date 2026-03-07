@@ -1,14 +1,16 @@
 """
 FastAPI application factory with full lifespan management.
 
-This is the **SQLite / no-Redis** variant.  Redis is NOT required.
+Backend mode is controlled by ``CACHE_BACKEND`` env var:
+  - ``memory`` (default): In-memory caches + SQLite checkpointer (no Redis).
+  - ``redis``: Redis-backed caches + Redis checkpointer (multi-worker safe).
 
 Startup sequence:
   1. Validate configuration
   2. Initialise Neo4j graph connection
-  3. Initialise in-memory schema cache → warm up schema
-  4. Initialise LangGraph checkpointer (SQLite by default)
-  5. Configure LangChain LLM response cache (in-memory)
+  3. Initialise schema cache (+ optional Redis client) → warm up schema
+  4. Initialise LangGraph checkpointer
+  5. Configure LangChain LLM response cache
   6. Build LangChain tools (with injected dependencies)
   7. Compile LangGraph agent
   8. Register FastMCP tools
@@ -18,7 +20,8 @@ Startup sequence:
 Shutdown sequence (reverse):
   A. Cancel schema proactive-refresh background task
   B. Close checkpointer connection
-  C. Close Neo4j driver
+  C. Close Redis client (if applicable)
+  D. Close Neo4j driver
 """
 from __future__ import annotations
 
@@ -30,6 +33,14 @@ from typing import AsyncIterator
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.globals import set_llm_cache
+
+# Redis imports — only needed when cache_backend="redis"
+try:
+    import redis.asyncio as aioredis
+    from langchain_community.cache import RedisCache
+except ImportError:
+    aioredis = None  # type: ignore[assignment]
+    RedisCache = None  # type: ignore[assignment,misc]
 
 from src.agent.checkpointer import close_checkpointer, init_checkpointer
 from src.agent.factory import get_compiled_agent, init_agent
@@ -75,6 +86,16 @@ logger = logging.getLogger(__name__)
 _API_V1_PREFIX = "/api/v1"
 
 
+def _set_inmemory_llm_cache() -> None:
+    """Configure an in-memory LLM response cache (no Redis)."""
+    try:
+        from langchain_community.cache import InMemoryCache
+    except ImportError:
+        from langchain.cache import InMemoryCache  # type: ignore[no-redef]
+    set_llm_cache(InMemoryCache())
+    logger.info("LLM cache: InMemoryCache (per-process).")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
@@ -89,17 +110,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from src.core.logging import setup_logging
     setup_logging(settings.log_level, settings=settings)
 
-    logger.info("═══ %s — startup (no-Redis variant) ═══", settings.app_name)
+    variant = "Redis" if settings.use_redis else "in-memory"
+    logger.info("═══ %s — startup (%s backend) ═══", settings.app_name, variant)
 
     # ── 1. Neo4j ──────────────────────────────────────────────────────────────
     logger.info("[1/8] Initialising Neo4j...")
     graph = init_graph(settings)
 
-    # ── 2. In-memory schema cache (no Redis) ──────────────────────────────────
-    logger.info("[2/8] Initialising in-memory schema cache...")
+    # ── 2. Schema cache (+ optional Redis client) ─────────────────────────────
+    redis_client = None
+    if settings.use_redis:
+        if aioredis is None:
+            raise RuntimeError(
+                "CACHE_BACKEND='redis' but redis package is not installed. "
+                "Install with: pip install 'redis[asyncio]'"
+            )
+        logger.info("[2/8] Initialising Redis + schema cache...")
+        redis_client = aioredis.from_url(settings.redis_url, decode_responses=False)
+    else:
+        logger.info("[2/8] Initialising in-memory schema cache...")
+
     schema_cache = SchemaCache(
         graph=graph,
         ttl_seconds=settings.schema_cache_ttl_seconds,
+        redis_client=redis_client,
     )
     await schema_cache.warm_up()
     set_schema_cache_instance(schema_cache)
@@ -113,36 +147,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ── 2c. Build dynamic coreference regex from schema labels ────────────────
-    set_coreference_regex(build_coreference_regex(topology.label_names, nlp_terms_by_label=topology.nlp_terms_by_label))
+    set_coreference_regex(build_coreference_regex(
+        topology.label_names,
+        nlp_terms_by_label=topology.nlp_terms_by_label,
+    ))
     logger.info("Coreference regex updated for %d labels.", len(topology.label_names))
 
-    # ── 3. LangGraph checkpointer (SQLite / Redis / Memory) ──────────────────
-    logger.info("[3/8] Initialising LangGraph checkpointer (backend=%s)...", settings.checkpointer_backend)
-    await init_checkpointer(
-        backend=settings.checkpointer_backend,
-        redis_url=settings.redis_url,
-        sqlite_path=settings.sqlite_checkpoint_path,
-    )
+    # ── 3. LangGraph checkpointer ─────────────────────────────────────────────
+    if settings.use_redis:
+        logger.info("[3/8] Initialising LangGraph checkpointer (backend=redis)...")
+        await init_checkpointer(backend="redis", redis_url=settings.redis_url)
+    else:
+        logger.info("[3/8] Initialising LangGraph checkpointer (backend=%s)...", settings.checkpointer_backend)
+        await init_checkpointer(
+            backend=settings.checkpointer_backend,
+            redis_url=settings.redis_url,
+            sqlite_path=settings.sqlite_checkpoint_path,
+        )
 
-    # ── 4. LLM response cache (in-memory — no Redis required) ────────────────
+    # ── 4. LLM response cache ────────────────────────────────────────────────
     logger.info("[4/8] Configuring LLM response cache...")
-    try:
-        from langchain_community.cache import InMemoryCache
-    except ImportError:
-        from langchain.cache import InMemoryCache  # type: ignore[no-redef]
-    set_llm_cache(InMemoryCache())
-    logger.info("LLM cache: InMemoryCache (per-process).")
+    if settings.use_redis and RedisCache is not None:
+        try:
+            import redis as sync_redis
+            sync_redis_client = sync_redis.from_url(
+                settings.redis_url, socket_connect_timeout=2,
+            )
+            sync_redis_client.ping()
+            set_llm_cache(
+                RedisCache(
+                    redis_=sync_redis_client,
+                    ttl=settings.llm_cache_ttl_seconds,
+                )
+            )
+            logger.info("LLM cache: Redis (TTL=%ds)", settings.llm_cache_ttl_seconds)
+        except Exception as exc:
+            logger.warning("Redis LLM cache unavailable (%s); falling back to in-memory.", exc)
+            _set_inmemory_llm_cache()
+    else:
+        _set_inmemory_llm_cache()
 
-    # ── 4b. Query deduplicator (in-memory) ────────────────────────────────────
+    # ── 4b. Query deduplicator ────────────────────────────────────────────────
     if settings.query_dedup_enabled:
         query_dedup = QueryDeduplicator(
             ttl_seconds=settings.query_cache_ttl_seconds,
             enabled=True,
+            redis_client=redis_client,
         )
         set_query_dedup_instance(query_dedup)
+        cache_type = "Redis" if redis_client else "in-memory"
         logger.info(
-            "Query deduplication ENABLED (TTL=%ds, in-memory).",
-            settings.query_cache_ttl_seconds,
+            "Query deduplication ENABLED (TTL=%ds, %s).",
+            settings.query_cache_ttl_seconds, cache_type,
         )
     else:
         query_dedup = QueryDeduplicator(enabled=False)
@@ -187,6 +243,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("═══ %s — shutdown ═══", settings.app_name)
     await schema_cache.stop_refresh_task()
     await close_checkpointer()
+    if redis_client is not None:
+        await redis_client.aclose()
     close_graph()
     logger.info("Shutdown complete.")
 

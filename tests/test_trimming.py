@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from app.agent.trimming import trim_conversation, _estimate_tokens
+from src.agent.trimming import trim_conversation, _estimate_tokens
 
 
 # ── Token estimator tests ─────────────────────────────────────────────────────
