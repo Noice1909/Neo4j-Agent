@@ -121,20 +121,63 @@ def build_supervisor_graph(
             role = "User" if isinstance(msg, HumanMessage) else "Assistant"
             conversation_context += f"{role}: {str(msg.content)[:200]}\n"
 
-        # Classification prompt
+        # Build dynamic examples from schema (domain-agnostic)
+        example_labels = topology.label_names[:3] if len(topology.label_names) >= 3 else topology.label_names
+        data_query_examples = []
+
+        # Add label-based examples
+        if example_labels:
+            data_query_examples.append(f"'How many {example_labels[0]} are there?'")
+            if len(example_labels) > 1:
+                data_query_examples.append(f"'List all {example_labels[1]}'")
+            if len(topology.triples) > 0:
+                triple = topology.triples[0]
+                data_query_examples.append(f"'Find {triple.source_label} connected to {triple.target_label}'")
+
+        # Add property-based examples (to help classify property queries)
+        property_examples = []
+        for li in topology.labels[:2]:  # Use first 2 labels
+            if li.properties:
+                # Pick first property as example
+                prop = li.properties[0]
+                property_examples.append(f"'What are the most popular {prop}?'")
+                break
+
+        if property_examples:
+            data_query_examples.extend(property_examples)
+
+        # Pre-classification: Check if question mentions any properties
+        # If it does, it's very likely a graph_query, not schema_info
+        all_properties = set()
+        for li in topology.labels:
+            all_properties.update(li.properties)
+
+        question_lower = user_question.lower()
+        mentions_property = any(prop.lower() in question_lower for prop in all_properties if len(prop) > 3)
+
+        # Classification prompt (fully generic, property-aware)
         classification_prompt = (
             "Given the user's message, classify it into one of these categories:\n\n"
-            "- 'graph_query': Questions asking for SPECIFIC DATA, entities, relationships, counts, or listings.\n"
-            "  Examples: 'Tell me about Tom Hanks movies', 'How many users are there?', 'What applications use Platform X?'\n\n"
+            "- 'graph_query': Questions asking for SPECIFIC DATA, entities, relationships, counts, listings, or property values.\n"
+            "  This includes questions about property values like 'most popular X', 'all Y', 'find Z'.\n"
+            f"  Examples: {', '.join(data_query_examples) if data_query_examples else 'Questions about specific entities or data'}\n\n"
             "- 'schema_info': Questions asking WHAT TYPES of data exist or what labels/properties are available.\n"
+            "  Only classify as schema_info if asking about the schema itself, not data values.\n"
             "  Examples: 'What types of entities exist?', 'What labels are available?', 'What data do you have?'\n\n"
             "- 'vector_search': Requests for semantic similarity or 'similar to' searches.\n"
             "  Examples: 'Find things similar to X', 'What's related to Y?'\n\n"
             "- 'direct': Greetings, thank you, clarifications, or general conversation.\n"
             "  Examples: 'Hello', 'Thank you', 'What can you do?'\n\n"
             f"User message: {user_question}\n\n"
-            "Respond with ONLY the category name (no explanation)."
         )
+
+        # Add hint if property is mentioned
+        if mentions_property:
+            classification_prompt += (
+                "IMPORTANT: This question mentions a property name, so it's asking for DATA, not schema info.\n\n"
+            )
+
+        classification_prompt += "Respond with ONLY the category name (no explanation)."
 
         # Invoke LLM for classification
         loop = asyncio.get_running_loop()
@@ -156,6 +199,15 @@ def build_supervisor_graph(
             route = "direct"
         else:
             # Default to graph_query
+            route = "graph_query"
+
+        # Override: If question mentions a property, it's definitely graph_query
+        # This prevents misclassification of property queries as schema_info
+        if mentions_property and route == "schema_info":
+            logger.info(
+                "Overriding schema_info → graph_query (question mentions property)"
+            )
+            trace_event("CLASSIFICATION_OVERRIDE", "info", "Property mention detected")
             route = "graph_query"
 
         trace_event("SUPERVISOR_ROUTE", "info", f"Route: {route}")

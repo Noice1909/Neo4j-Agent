@@ -66,7 +66,7 @@ def build_synthesis_node(llm: "BaseChatModel"):
                     "final_answer": "I couldn't find any information to answer that question.",
                 }
 
-            # Build QA synthesis prompt
+            # Build QA synthesis prompt (fully generic)
             results_text = str(results)[:2000]  # Limit to 2000 chars for prompt
             qa_prompt = (
                 f"Question: {question}\n"
@@ -81,15 +81,12 @@ def build_synthesis_node(llm: "BaseChatModel"):
                 "   - 'According to the database...'\n"
                 "   - 'The query shows...'\n"
                 "   - 'Based on the database...'\n"
-                "4. CORRECT examples:\n"
-                "   ✓ 'There are 8 movies'\n"
-                "   ✓ 'Christopher Nolan directed 3 movies'\n"
-                "   ✓ 'The top actors are...'\n"
-                "5. WRONG examples (DO NOT USE):\n"
-                "   ✗ 'There are 8 movies in the database'\n"
-                "   ✗ 'The database shows Christopher Nolan directed 3 movies'\n"
-                "   ✗ 'According to the database, the top actors are...'\n"
-                "6. Answer as if you naturally know this information\n\n"
+                "4. Format guidelines:\n"
+                "   ✓ State facts directly: 'There are X items'\n"
+                "   ✓ Use natural phrasing: 'Y has Z connections'\n"
+                "   ✓ List results clearly when appropriate\n"
+                "   ✗ DO NOT add phrases like 'in the database', 'according to', 'the system shows'\n"
+                "5. Answer as if you naturally know this information\n\n"
                 "Your answer:"
             )
 
