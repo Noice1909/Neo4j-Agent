@@ -74,6 +74,9 @@ class PipelineState(TypedDict, total=False):
     # ── Synthesis Agent (10) ───────────────────────────────
     final_answer: str
 
+    # ── Entity Hints (entity-label associations) ─────────────
+    entity_hints: list[dict]         # [{entity_name, label, match_type}, ...]
+
     # ── Schema Reasoning (semantic layer) ───────────────────
     property_mappings: list[dict]    # NL term → property annotations
     schema_context: str              # resolved schema hints for Cypher generation

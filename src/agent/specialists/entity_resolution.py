@@ -20,8 +20,87 @@ if TYPE_CHECKING:
     from langchain_neo4j import Neo4jGraph
     from src.core.config import Settings
     from src.graph.schema_cache import SchemaCache
+    from src.graph.topology import GraphTopology
 
 logger = logging.getLogger(__name__)
+
+
+# ── Entity label lookup helper ───────────────────────────────────────────
+
+
+async def _lookup_entity_labels(
+    graph: "Neo4jGraph",
+    question: str,
+    topology: "GraphTopology",
+) -> list[dict]:
+    """
+    Extract capitalized name candidates from *question* and query Neo4j
+    to find which label each entity belongs to.
+
+    Returns a list of hints like:
+        [{"entity_name": "Tom Hanks", "label": "Actor", "property": "name", "match_type": "exact"}]
+    """
+    import asyncio
+    import re
+
+    # Extract candidates: quoted strings + capitalized multi-word phrases
+    candidates: list[str] = []
+    for m in re.finditer(r"""["']([^"']+)["']""", question):
+        candidates.append(m.group(1))
+    for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", question):
+        phrase = m.group(1)
+        if phrase not in candidates:
+            candidates.append(phrase)
+
+    if not candidates:
+        return []
+
+    # Use name and title for lookup (avoid 'label' property which conflicts
+    # with the labels() function alias)
+    lookup_props = [p for p in (topology.display_properties or ["name", "title"])
+                    if p not in ("label",)][:3]
+    if not lookup_props:
+        lookup_props = ["name", "title"]
+    hints: list[dict] = []
+
+    loop = asyncio.get_running_loop()
+    for candidate in candidates:
+        where_clauses = " OR ".join(f"n.{p} = $name" for p in lookup_props)
+        return_props = ", ".join(f"n.{p} AS prop_{p}" for p in lookup_props)
+        cypher = (
+            f"MATCH (n) WHERE {where_clauses} "
+            f"RETURN labels(n)[0] AS node_label, {return_props} "
+            "LIMIT 1"
+        )
+        try:
+            results = await loop.run_in_executor(
+                None,
+                lambda c=candidate, q=cypher: graph.query(q, params={"name": c}),
+            )
+            if results:
+                row = results[0]
+                node_label = row.get("node_label", "")
+                if not node_label:
+                    continue
+                # Find which property matched
+                matched_prop = lookup_props[0]
+                for p in lookup_props:
+                    val = row.get(f"prop_{p}")
+                    if val and str(val) == candidate:
+                        matched_prop = p
+                        break
+                hints.append({
+                    "entity_name": candidate,
+                    "label": node_label,
+                    "property": matched_prop,
+                    "match_type": "exact",
+                })
+        except Exception as exc:
+            logger.debug(
+                "Entity label lookup failed for '%s': %s", candidate, exc,
+            )
+
+    return hints
 
 
 def build_entity_resolution_node(
@@ -143,6 +222,33 @@ def build_entity_resolution_node(
             except Exception as exc:
                 logger.debug("Property resolution failed (non-fatal): %s", exc)
 
+            # ── Layer 2.5: Entity label lookup ───────────────────
+            # For entity names in the question (exact or fuzzy matched),
+            # discover which label they belong to so Cypher gen knows
+            # e.g. "Tom Hanks" is an Actor.name
+            # Use ORIGINAL question for candidate extraction (before entity
+            # resolution capitalizes label words, which merges with names)
+            entity_hints = []
+            try:
+                entity_hints = await _lookup_entity_labels(
+                    graph, question, topology,
+                )
+                if entity_hints:
+                    logger.info(
+                        "Entity hints: %s",
+                        ", ".join(
+                            f"{h['entity_name']}→{h['label']}.{h['property']}"
+                            for h in entity_hints[:5]
+                        ),
+                    )
+                    trace_event(
+                        "ENTITY_HINTS",
+                        "ok",
+                        f"{len(entity_hints)} hint(s)",
+                    )
+            except Exception as exc:
+                logger.debug("Entity label lookup failed (non-fatal): %s", exc)
+
             # Serialize corrections and topology for state
             import json
             corrections_json = [asdict(c) for c in resolution.corrections]
@@ -156,6 +262,7 @@ def build_entity_resolution_node(
                 "resolution_corrections": corrections_json,
                 "full_topology_json": topology_json,
                 "property_mappings": property_mappings,
+                "entity_hints": entity_hints,
             }
 
         except Exception as exc:

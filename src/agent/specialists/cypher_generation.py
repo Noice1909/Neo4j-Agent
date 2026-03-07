@@ -113,6 +113,17 @@ def build_cypher_generation_node(llm: "BaseChatModel"):
             if schema_context:
                 prompt_text += f"\n\n{schema_context}"
 
+            # Add entity hints (entity-label associations from DB lookup)
+            entity_hints = state.get("entity_hints", [])
+            if entity_hints:
+                hints_lines = ["Entity hints (names found in the database):"]
+                for h in entity_hints:
+                    hints_lines.append(
+                        f"- \"{h['entity_name']}\" is a {h['label']} "
+                        f"(matched on {h['property']} property)"
+                    )
+                prompt_text += "\n\n" + "\n".join(hints_lines)
+
             prompt_text += f"\n\nQuestion: {question}\nCypher:"
 
             # Invoke LLM to generate Cypher
