@@ -1,0 +1,114 @@
+%% Complete Neo4j Multi-Agent System Design
+%% Shows data flow from user query to response
+
+graph TB
+    User([User]) -->|HTTP POST /chat| API[FastAPI Server<br/>Port 8000]
+
+    subgraph "Request Processing"
+        API --> Auth[Authentication<br/>Rate Limiting]
+        Auth --> SessionMgr[Session Manager<br/>Get/Create Session]
+        SessionMgr --> Supervisor
+    end
+
+    subgraph "Multi-Agent Pipeline (LangGraph StateGraph)"
+        Supervisor[1. Supervisor Agent<br/>Query Routing]
+        Supervisor --> Route{Route?}
+
+        Route -->|graph_query| Pipeline
+        Route -->|schema_info| SchemaAgent[Schema Info Agent]
+        Route -->|direct| DirectAgent[Direct Response Agent]
+
+        subgraph Pipeline [Graph Query Pipeline - 9 Agents]
+            A2[2. Coreference Resolution<br/>Resolve pronouns]
+            A3[3. Entity Resolution<br/>5-Layer Pipeline]
+            A4[4. Topology Filter<br/>Schema Reasoning]
+            A5[5. Cypher Generation<br/>Few-Shot + Hints]
+            A6[6. Cypher Validation<br/>4-Stage Checks]
+            A7[7. Cypher Execution<br/>Execute Query]
+            A8[8. Result Verification<br/>Validate Results]
+            A9[9. Retry Decision<br/>Error Analysis]
+            A10[10. Synthesis<br/>Generate Response]
+
+            A2 --> A3
+            A3 --> A4
+            A4 --> A5
+            A5 --> A6
+            A6 --> A7
+            A7 --> A8
+            A8 --> Decision{Valid?}
+            Decision -->|No & retries<3| A9
+            Decision -->|Yes| A10
+            A9 -->|Correction guidance| A5
+        end
+    end
+
+    subgraph "Data Layer"
+        Neo4j[(Neo4j Database<br/>AuraDB/Local)]
+        Cache{Cache Backend?}
+        Cache -->|memory| MemCache[In-Memory Cache<br/>Schema + LLM]
+        Cache -->|redis| RedisCache[(Redis Cluster<br/>Distributed Cache)]
+
+        Checkpointer{Checkpointer?}
+        Checkpointer -->|sqlite| SQLite[(SQLite DB<br/>Conversation State)]
+        Checkpointer -->|redis| RedisCheck[(Redis<br/>Conversation State)]
+    end
+
+    subgraph "Schema Intelligence (Startup)"
+        SchemaInit[Schema Extraction] --> TopologyBuild[Build GraphTopology<br/>Labels, Properties,<br/>Relationships]
+        TopologyBuild --> SemanticGen[Schema Semantic Layer<br/>ONE LLM Call]
+        SemanticGen --> SynonymMaps[Build Synonym Maps<br/>Property + Relationship]
+        SynonymMaps --> CacheStore[Store in Cache<br/>Hash-Based Key]
+    end
+
+    subgraph "LLM Layer"
+        Ollama[Ollama Server<br/>localhost:11434]
+        Model[Qwen 2.5:14b<br/>Local Model]
+        Ollama --> Model
+    end
+
+    subgraph "Observability"
+        Metrics[Prometheus Metrics<br/>/metrics endpoint]
+        Logs[Structured Logs<br/>JSON + Trace Events]
+        Tracing[Session + Turn IDs<br/>Event Tracking]
+    end
+
+    %% Data Flow Connections
+    A3 -.->|Layer 2: APOC Fuzzy| Neo4j
+    A3 -.->|Layer 2.5: Label Lookup| Neo4j
+    A4 -.->|Load Topology| Cache
+    A5 -.->|LLM Call| Ollama
+    A7 -.->|Execute Cypher| Neo4j
+    A10 -.->|LLM Call| Ollama
+
+    Pipeline -.->|Load/Save State| Checkpointer
+    Pipeline -.->|Cache LLM Responses| Cache
+
+    Neo4j -.->|Schema Extraction| SchemaInit
+    CacheStore -.-> Cache
+
+    API --> Metrics
+    Pipeline --> Logs
+    Pipeline --> Tracing
+
+    A10 --> Response[Natural Language Response]
+    SchemaAgent --> Response
+    DirectAgent --> Response
+    Response --> API
+    API -->|JSON Response| User
+
+    %% Styling
+    classDef userLayer fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef apiLayer fill:#fff9c4,stroke:#f57f17,stroke-width:2px
+    classDef agentLayer fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef dataLayer fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+    classDef llmLayer fill:#ffccbc,stroke:#d84315,stroke-width:2px
+    classDef schemaLayer fill:#b2dfdb,stroke:#00695c,stroke-width:2px
+    classDef obsLayer fill:#d1c4e9,stroke:#512da8,stroke-width:2px
+
+    class User,Response userLayer
+    class API,Auth,SessionMgr apiLayer
+    class Supervisor,Route,Pipeline,A2,A3,A4,A5,A6,A7,A8,A9,A10,Decision,SchemaAgent,DirectAgent agentLayer
+    class Neo4j,Cache,MemCache,RedisCache,Checkpointer,SQLite,RedisCheck dataLayer
+    class Ollama,Model llmLayer
+    class SchemaInit,TopologyBuild,SemanticGen,SynonymMaps,CacheStore schemaLayer
+    class Metrics,Logs,Tracing obsLayer

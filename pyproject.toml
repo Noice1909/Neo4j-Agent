@@ -5,8 +5,21 @@ build-backend = "setuptools.backends.legacy:build"
 [project]
 name = "neo4j-agent"
 version = "1.0.0"
-description = "Enterprise Neo4j LangGraph Agent with FastAPI and FastMCP"
+description = "Schema-aware Neo4j multi-agent system with semantic layer, entity resolution, and dual backend support (memory/Redis)"
 requires-python = ">=3.11"
+readme = "README.md"
+authors = [
+    {name = "Neo4j Agent Team"}
+]
+keywords = ["neo4j", "langgraph", "fastapi", "cypher", "graph-database", "multi-agent", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     # Web framework
     "fastapi>=0.115.0",
@@ -19,11 +32,11 @@ dependencies = [
     "langchain-community>=0.3.0",
     "langchain-neo4j>=0.3.0",
     "langchain-ollama>=0.2.0",
-    # LangGraph + Redis checkpointer
+    # LangGraph + SQLite checkpointer (default)
     "langgraph>=0.2.0",
-    "langgraph-checkpoint-redis>=2.0.0",
-    # Redis
-    "redis[asyncio]>=5.0.0",
+    "langgraph-checkpoint>=4.0.0",
+    "langgraph-checkpoint-sqlite>=3.0.0",
+    "aiosqlite>=0.22.0",
     # Neo4j driver
     "neo4j>=5.19.0",
     # Config
@@ -42,6 +55,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+redis = [
+    # Redis backend dependencies (for CACHE_BACKEND=redis)
+    "redis[asyncio]>=5.0.0",
+    "langgraph-checkpoint-redis>=0.3.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

@@ -1,0 +1,112 @@
+%% Entity Resolution Pipeline Flow
+%% 5-Layer Architecture with Layer 2.5 Entity Hints
+
+graph TB
+    Start([User Question:<br/>'Tell me about Tom Hanks movies']) --> L05
+
+    subgraph "Layer 0.5: Concept Full-Text Index"
+        L05[Query concept_name_description_ft<br/>Semantic label mapping]
+        L05 --> L05Result{Match?}
+        L05Result -->|Yes| L05Correct["'movies' → 'Movie'"]
+        L05Result -->|No| L05Skip[No correction]
+    end
+
+    L05Correct --> L1
+    L05Skip --> L1
+
+    subgraph "Layer 1: Label Synonym Resolution"
+        L1[3-Layer Synonym Map:<br/>1. User overrides<br/>2. Pattern-based<br/>3. Concept NLP terms]
+        L1 --> L1Result{Match?}
+        L1Result -->|Yes| L1Correct["'movies' → 'Movie'<br/>(pluralization)"]
+        L1Result -->|No| L1Skip[No correction]
+    end
+
+    L1Correct --> L15
+    L1Skip --> L15
+
+    subgraph "Layer 1.5: Property Term Resolution"
+        L15[Property Synonym Map:<br/>NL term → property]
+        L15 --> L15Check{Property<br/>term found?}
+        L15Check -->|Yes| L15Map["'genre' → Movie.movie_type<br/>Store in property_mappings"]
+        L15Check -->|No| L15Skip[No mapping]
+    end
+
+    L15Map --> L2
+    L15Skip --> L2
+
+    subgraph "Layer 2: Entity Name Resolution"
+        L2[Extract Candidates:<br/>Quoted strings, ALL-CAPS,<br/>Capitalized phrases]
+        L2 --> L2Strategy{Which<br/>Strategy?}
+
+        L2Strategy -->|Has ID Index| L2aID["2a-id: globalIndex<br/>ID-based FT (~1ms)"]
+        L2Strategy -->|Has Name Index| L2a["2a: globalNameIndex<br/>Name-based FT (~1ms)"]
+        L2Strategy -->|Has APOC| L2b["2b: APOC Multi-Signal<br/>Levenshtein+Dice+Jaro<br/>(50-500ms)"]
+        L2Strategy -->|Phonetic| L2c["2c: APOC Phonetic<br/>doubleMetaphone<br/>(50-500ms)"]
+
+        L2aID --> L2Match{Match<br/>Found?}
+        L2a --> L2Match
+        L2b --> L2Match
+        L2c --> L2Match
+
+        L2Match -->|No| L2None[No match found]
+        L2Match -->|Exact Match| L2Exact["'Tom Hanks' found<br/>NO correction created<br/>(exact match discarded)"]
+        L2Match -->|Fuzzy Match| L2Fuzzy["Typo corrected<br/>confidence = similarity"]
+    end
+
+    L2None --> L25
+    L2Exact --> L25
+    L2Fuzzy --> L25
+
+    subgraph "Layer 2.5: Entity Label Lookup ⭐ NEW"
+        L25[Extract candidates from<br/>ORIGINAL question<br/>before entity resolution]
+        L25 --> L25Extract["Regex: capitalized phrases<br/>'Tom Hanks'"]
+        L25Extract --> L25Query["MATCH (n)<br/>WHERE n.name = 'Tom Hanks'<br/>RETURN labels(n)"]
+        L25Query --> L25Result{Found in DB?}
+
+        L25Result -->|Yes| L25Hint["Entity Hint Created:<br/>{<br/>  entity_name: 'Tom Hanks',<br/>  label: 'Actor',<br/>  property: 'name',<br/>  match_type: 'exact'<br/>}"]
+        L25Result -->|No| L25NoHint[No hint]
+    end
+
+    L25Hint --> L3Check
+    L25NoHint --> L3Check
+
+    subgraph "Layer 3: LLM Fallback"
+        L3Check{Any<br/>corrections<br/>so far?}
+        L3Check -->|Yes| L3Skip["Skip Layer 3<br/>(already corrected)"]
+        L3Check -->|No| L3LLM["LLM analyzes question<br/>with schema context"]
+        L3LLM --> L3Result{Different?}
+        L3Result -->|Yes| L3Correct["Create LLM correction<br/>confidence = 0.7"]
+        L3Result -->|No| L3NoCorrect[No correction]
+    end
+
+    L3Skip --> Output
+    L3Correct --> Output
+    L3NoCorrect --> Output
+
+    Output([Output to Pipeline:<br/>- resolved_question<br/>- resolution_corrections<br/>- property_mappings<br/>- entity_hints])
+
+    Output --> CypherGen[Cypher Generation<br/>with Entity Hints]
+
+    subgraph "Cypher Generation Enhancement"
+        CypherGen --> Prompt["Prompt includes:<br/><br/>Entity hints:<br/>- 'Tom Hanks' is a Actor<br/>  (matched on name property)<br/><br/>Property mappings:<br/>- 'genre' → Movie.movie_type"]
+        Prompt --> Generated["Generated Cypher:<br/>MATCH (a:Actor {name: 'Tom Hanks'})<br/>  -[:ACTED_IN]->(m:Movie)<br/>RETURN m"]
+    end
+
+    %% Styling
+    classDef layer05 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef layer1 fill:#fff9c4,stroke:#f57f17,stroke-width:2px
+    classDef layer15 fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
+    classDef layer2 fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef layer25 fill:#ffeb3b,stroke:#f57f17,stroke-width:3px
+    classDef layer3 fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    classDef output fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
+    classDef cypher fill:#4caf50,stroke:#2e7d32,stroke-width:3px
+
+    class L05,L05Result,L05Correct,L05Skip layer05
+    class L1,L1Result,L1Correct,L1Skip layer1
+    class L15,L15Check,L15Map,L15Skip layer15
+    class L2,L2Strategy,L2aID,L2a,L2b,L2c,L2Match,L2None,L2Exact,L2Fuzzy layer2
+    class L25,L25Extract,L25Query,L25Result,L25Hint,L25NoHint layer25
+    class L3Check,L3Skip,L3LLM,L3Result,L3Correct,L3NoCorrect layer3
+    class Output output
+    class CypherGen,Prompt,Generated cypher
