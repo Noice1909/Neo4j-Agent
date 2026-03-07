@@ -149,3 +149,158 @@ def build_synonym_map(
 
     logger.debug("Synonym map built with %d entries.", len(result))
     return result
+
+
+# ── Property synonym map ─────────────────────────────────────────────────────
+
+
+def _property_pattern_synonyms(prop_name: str) -> list[str]:
+    """Generate pattern-based synonyms for a property name."""
+    synonyms: list[str] = [prop_name.lower()]
+
+    # Underscore split: movie_type → "movie type", "type", "movie"
+    if "_" in prop_name:
+        natural = prop_name.replace("_", " ").lower()
+        synonyms.append(natural)
+        for word in natural.split():
+            if len(word) >= 3:
+                synonyms.append(word)
+
+    # CamelCase split: releaseDate → "release date", "release", "date"
+    parts = _camel_parts(prop_name)
+    if len(parts) > 1:
+        synonyms.append(" ".join(p.lower() for p in parts))
+        for p in parts:
+            if len(p) >= 3:
+                synonyms.append(p.lower())
+
+    # Plural
+    synonyms.append(_plural(prop_name.lower()))
+
+    return list(dict.fromkeys(synonyms))  # deduplicate preserving order
+
+
+def build_property_synonym_map(
+    topology: "GraphTopology",
+    semantic_layer: "SchemaSemanticLayer | None" = None,
+) -> "dict[str, tuple[str, str]]":
+    """
+    Build a synonym map for properties: nl_term → (label, property_name).
+
+    Layers (highest priority wins):
+      A. Pattern-based: underscore_split, camelCase_split, plural
+      B. Semantic layer (LLM-generated at startup)
+      C. Property nlp_terms from topology (enriched by semantic layer)
+
+    Parameters
+    ----------
+    topology:
+        The live graph topology with label + property info.
+    semantic_layer:
+        Optional SchemaSemanticLayer from the startup LLM call.
+
+    Returns
+    -------
+    dict
+        Lowercase NL term → (label, property_name) mapping.
+    """
+    from src.graph.topology import GraphTopology
+    if semantic_layer is not None:
+        from src.graph.semantic_layer import SchemaSemanticLayer
+
+    result: dict[str, tuple[str, str]] = {}
+
+    # Layer A: Pattern-based
+    for li in topology.labels:
+        for prop in li.properties:
+            for syn in _property_pattern_synonyms(prop):
+                if syn and len(syn) >= 3:
+                    result[syn] = (li.label, prop)
+
+    # Layer B: Semantic layer NL terms (LLM-generated)
+    if semantic_layer is not None:
+        for label, props in semantic_layer.property_semantics.items():
+            for ps in props:
+                for nl_name in ps.natural_names:
+                    key = nl_name.lower().strip()
+                    if key and len(key) >= 2:
+                        result[key] = (ps.label, ps.property_name)
+
+    # Layer C: Property nlp_terms from topology
+    for li in topology.labels:
+        for prop, terms in li.property_nlp_terms.items():
+            for term in terms:
+                key = term.lower().strip()
+                if key:
+                    result[key] = (li.label, prop)
+
+    logger.debug("Property synonym map built with %d entries.", len(result))
+    return result
+
+
+# ── Relationship synonym map ────────────────────────────────────────────────
+
+
+def _rel_pattern_synonyms(rel_type: str) -> list[str]:
+    """Generate pattern-based synonyms for a relationship type."""
+    synonyms: list[str] = [rel_type.lower()]
+
+    # Underscore to space: ACTED_IN → "acted in"
+    if "_" in rel_type:
+        natural = rel_type.replace("_", " ").lower()
+        synonyms.append(natural)
+        for word in natural.split():
+            if len(word) >= 3:
+                synonyms.append(word)
+
+    # Remove common prefixes: HAS_GENRE → "genre"
+    for prefix in ("has_", "is_", "was_", "belongs_to_"):
+        if rel_type.lower().startswith(prefix):
+            stripped = rel_type[len(prefix):].replace("_", " ").lower().strip()
+            if stripped:
+                synonyms.append(stripped)
+
+    return list(dict.fromkeys(synonyms))  # deduplicate
+
+
+def build_relationship_synonym_map(
+    topology: "GraphTopology",
+    semantic_layer: "SchemaSemanticLayer | None" = None,
+) -> "dict[str, str]":
+    """
+    Build a synonym map for relationships: nl_phrase → rel_type.
+
+    Layers:
+      A. Pattern-based: underscore_to_space, strip common prefixes
+      B. Semantic layer (LLM-generated at startup)
+
+    Parameters
+    ----------
+    topology:
+        The live graph topology with relationship triples.
+    semantic_layer:
+        Optional SchemaSemanticLayer from the startup LLM call.
+
+    Returns
+    -------
+    dict
+        Lowercase NL phrase → rel_type mapping.
+    """
+    result: dict[str, str] = {}
+
+    # Layer A: Pattern-based
+    for t in topology.triples:
+        for syn in _rel_pattern_synonyms(t.rel_type):
+            if syn and len(syn) >= 3:
+                result[syn] = t.rel_type
+
+    # Layer B: Semantic layer NL phrases
+    if semantic_layer is not None:
+        for rs in semantic_layer.relationship_semantics:
+            for phrase in rs.natural_phrases:
+                key = phrase.lower().strip()
+                if key:
+                    result[key] = rs.rel_type
+
+    logger.debug("Relationship synonym map built with %d entries.", len(result))
+    return result

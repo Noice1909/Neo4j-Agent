@@ -34,6 +34,11 @@ import time
 from typing import TYPE_CHECKING
 
 from src.core.exceptions import SchemaUnavailableError
+from src.graph.semantic_layer import (
+    SchemaSemanticLayer,
+    semantic_layer_from_json,
+    semantic_layer_to_json,
+)
 from src.graph.topology import GraphTopology, LabelInfo, RelationshipTriple, extract_topology
 
 if TYPE_CHECKING:
@@ -45,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Redis key names (only used when redis_client is provided)
 _SCHEMA_REDIS_KEY = "neo4j:schema"
 _TOPOLOGY_REDIS_KEY = "neo4j:topology"
+_SEMANTIC_LAYER_REDIS_KEY = "neo4j:semantic_layer"
 
 
 # ── Topology serialization helpers (Redis mode) ─────────────────────────────
@@ -110,6 +116,7 @@ class SchemaCache:
         self._cached_schema: str | None = None
         self._cached_at: float = 0.0  # monotonic timestamp
         self._cached_topology: GraphTopology | None = None
+        self._cached_semantic_layer: SchemaSemanticLayer | None = None
         self._refresh_task: asyncio.Task | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -171,6 +178,24 @@ class SchemaCache:
             logger.warning("Topology unavailable — returning empty topology.")
             return GraphTopology()
         return self._cached_topology
+
+    def get_semantic_layer(self) -> SchemaSemanticLayer | None:
+        """Return the cached SchemaSemanticLayer, or None if not yet generated."""
+        return self._cached_semantic_layer
+
+    async def set_semantic_layer(self, layer: SchemaSemanticLayer) -> None:
+        """Store a SchemaSemanticLayer in cache (memory + optional Redis)."""
+        self._cached_semantic_layer = layer
+        if self._redis is not None:
+            try:
+                await self._redis.setex(
+                    _SEMANTIC_LAYER_REDIS_KEY,
+                    self._ttl,
+                    semantic_layer_to_json(layer),
+                )
+                logger.info("Semantic layer cached in Redis.")
+            except Exception as exc:
+                logger.warning("Redis semantic layer write failed: %s", exc)
 
     async def invalidate(self) -> None:
         """Clear the cached schema and topology so the next call re-fetches."""

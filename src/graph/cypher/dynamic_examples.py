@@ -194,7 +194,7 @@ def _p10_connected_via(
     )
 
 
-def _p11_distinct(li: "LabelInfo") -> "._Example | None":
+def _p11_distinct(li: "LabelInfo") -> "_Example | None":
     """DISTINCT keyword — remove duplicate values from property results."""
     if not li.display_property:
         return None
@@ -284,7 +284,7 @@ def _p18_exists_subquery(t: "RelationshipTriple", src: "LabelInfo") -> _Example:
     return (
         f"Find {t.source_label} that have at least one {t.target_label} connection.",
         f"MATCH (a:{t.source_label}) "
-        f"WHERE EXISTS {{ MATCH (a)-[:{t.rel_type}]->(:  {t.target_label}) }} "
+        f"WHERE EXISTS {{ MATCH (a)-[:{t.rel_type}]->(:{t.target_label}) }} "
         f"RETURN a.{dp} AS {t.source_label.lower()}",
     )
 
@@ -295,7 +295,7 @@ def _p19_not_negation(t: "RelationshipTriple", src: "LabelInfo") -> _Example:
     return (
         f"Find {t.source_label} that do NOT have {t.target_label} connections.",
         f"MATCH (a:{t.source_label}) "
-        f"WHERE NOT EXISTS {{ MATCH (a)-[:{t.rel_type}]->(:  {t.target_label}) }} "
+        f"WHERE NOT EXISTS {{ MATCH (a)-[:{t.rel_type}]->(:{t.target_label}) }} "
         f"RETURN a.{dp} AS {t.source_label.lower()}",
     )
 
@@ -849,7 +849,7 @@ def _collect_remaining(
 
 def generate_few_shot_examples(
     topology: "GraphTopology",
-    max_examples: int = 50,
+    max_examples: int = 15,
     manual_overrides: list[dict] | None = None,
     question: str | None = None,
 ) -> str:

@@ -44,6 +44,7 @@ def build_supervisor_graph(
     topology: "GraphTopology",
     graph: "Neo4jGraph",
     settings: "Settings",
+    semantic_layer=None,
 ) -> "CompiledGraph":
     """
     Build the supervisor agent graph.
@@ -69,7 +70,7 @@ def build_supervisor_graph(
         Compiled supervisor graph with routing to all specialists.
     """
     # ── Build pipeline subgraph ───────────────────────────────────────────────
-    pipeline_subgraph = build_pipeline_subgraph(llm, schema_cache, graph, settings)
+    pipeline_subgraph = build_pipeline_subgraph(llm, schema_cache, graph, settings, semantic_layer=semantic_layer)
 
     # ── Build system prompt ───────────────────────────────────────────────────
     system_prompt = build_system_prompt(

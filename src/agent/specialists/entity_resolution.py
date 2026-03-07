@@ -29,6 +29,7 @@ def build_entity_resolution_node(
     schema_cache: "SchemaCache",
     graph: "Neo4jGraph",
     settings: "Settings",
+    semantic_layer=None,
 ):
     """
     Build the entity resolution agent node.
@@ -43,6 +44,8 @@ def build_entity_resolution_node(
         Neo4j graph connection for querying full-text indexes.
     settings:
         Application settings (entity resolution config).
+    semantic_layer:
+        Optional SchemaSemanticLayer for NL-aware property/relationship mapping.
 
     Returns
     -------
@@ -111,6 +114,35 @@ def build_entity_resolution_node(
                 trace_event("ENTITY_RES_SKIP", "ok", "No corrections needed")
                 logger.debug("No entity resolution corrections needed")
 
+            # ── Layer 1.5: Property term resolution ──────────────────
+            property_mappings = []
+            try:
+                from src.graph.cypher.synonyms import build_property_synonym_map
+                prop_syn_map = build_property_synonym_map(topology, semantic_layer)
+
+                # Check each word in the question against property synonyms
+                resolved_q = resolution.resolved_question
+                for word in set(resolved_q.lower().split()):
+                    candidate = word.strip("?.,!'\"-")
+                    if len(candidate) >= 3 and candidate in prop_syn_map:
+                        label, prop_name = prop_syn_map[candidate]
+                        # Don't add if the word is also a label synonym (avoid ambiguity here)
+                        property_mappings.append({
+                            "nl_term": candidate,
+                            "label": label,
+                            "property": prop_name,
+                            "confidence": 0.9,
+                        })
+                if property_mappings:
+                    logger.info(
+                        "Property resolution: %d mapping(s) found: %s",
+                        len(property_mappings),
+                        ", ".join(f"{m['nl_term']}→{m['label']}.{m['property']}" for m in property_mappings[:3]),
+                    )
+                    trace_event("PROPERTY_RES", "ok", f"{len(property_mappings)} property mapping(s)")
+            except Exception as exc:
+                logger.debug("Property resolution failed (non-fatal): %s", exc)
+
             # Serialize corrections and topology for state
             import json
             corrections_json = [asdict(c) for c in resolution.corrections]
@@ -123,6 +155,7 @@ def build_entity_resolution_node(
                 "entity_resolved_question": resolution.resolved_question,
                 "resolution_corrections": corrections_json,
                 "full_topology_json": topology_json,
+                "property_mappings": property_mappings,
             }
 
         except Exception as exc:
@@ -132,10 +165,18 @@ def build_entity_resolution_node(
                 exc_info=True,
             )
             trace_event("ENTITY_RES_FAIL", "fail", str(exc)[:120])
-            # Fallback: pass question through unchanged
+            # Fallback: pass question through unchanged, still provide topology
+            fallback_topology_json = ""
+            try:
+                topo = await schema_cache.get_topology()
+                from src.graph.schema_cache import _topology_to_json
+                fallback_topology_json = _topology_to_json(topo)
+            except Exception:
+                pass
             return {
                 "entity_resolved_question": question,
                 "resolution_corrections": [],
+                "full_topology_json": fallback_topology_json,
             }
 
     return entity_resolution_node

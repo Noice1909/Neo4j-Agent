@@ -150,6 +150,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     ))
     logger.info("Coreference regex updated for %d labels.", len(topology.label_names))
 
+    # ── 2d. Generate schema semantic layer (one-time LLM call) ──────────────
+    logger.info("[2d] Generating schema semantic layer...")
+    from src.graph.semantic_layer import generate_semantic_layer
+    try:
+        # Need LLM early for semantic layer — create it now
+        _sl_llm = get_llm_from_settings(settings)
+        semantic_layer = await generate_semantic_layer(
+            topology=topology,
+            llm=_sl_llm,
+        )
+        await schema_cache.set_semantic_layer(semantic_layer)
+
+        # Enrich topology labels with property NL terms from semantic layer
+        for li in topology.labels:
+            for ps in semantic_layer.property_semantics.get(li.label, []):
+                if ps.natural_names:
+                    li.property_nlp_terms[ps.property_name] = ps.natural_names
+        logger.info(
+            "Semantic layer ready: %d NL property terms, %d NL relationship terms.",
+            len(semantic_layer.nl_to_property),
+            len(semantic_layer.nl_to_relationship),
+        )
+    except Exception as exc:
+        logger.warning("Semantic layer generation failed (non-fatal): %s", exc)
+        semantic_layer = None
+
     # ── 3. LangGraph checkpointer ─────────────────────────────────────────────
     if settings.use_redis:
         logger.info("[3/8] Initialising LangGraph checkpointer (backend=redis)...")
@@ -219,6 +245,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         topology=topology,
         graph=graph,
         settings=settings,
+        semantic_layer=semantic_layer,
     )
 
     # ── 7. Register FastMCP tools ─────────────────────────────────────────────

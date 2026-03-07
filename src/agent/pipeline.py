@@ -41,6 +41,7 @@ def build_pipeline_subgraph(
     schema_cache: "SchemaCache",
     graph: "Neo4jGraph",
     settings: "Settings",
+    semantic_layer=None,
 ) -> "CompiledGraph":
     """
     Build the graph query pipeline subgraph.
@@ -55,6 +56,8 @@ def build_pipeline_subgraph(
         Neo4j graph connection.
     settings:
         Application settings.
+    semantic_layer:
+        Optional SchemaSemanticLayer for NL-aware property/relationship mapping.
 
     Returns
     -------
@@ -63,8 +66,8 @@ def build_pipeline_subgraph(
     """
     # ── Build all specialist agent nodes ─────────────────────────────────────
     coreference_node = build_coreference_node(llm)
-    entity_resolution_node = build_entity_resolution_node(llm, schema_cache, graph, settings)
-    topology_filter_node = build_topology_filter_node(schema_cache)
+    entity_resolution_node = build_entity_resolution_node(llm, schema_cache, graph, settings, semantic_layer=semantic_layer)
+    topology_filter_node = build_topology_filter_node(schema_cache, llm=llm, semantic_layer=semantic_layer)
     cypher_generation_node = build_cypher_generation_node(llm)
     cypher_validation_node = build_cypher_validation_node()
     cypher_execution_node = build_cypher_execution_node(graph)

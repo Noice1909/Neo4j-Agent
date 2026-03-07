@@ -82,17 +82,23 @@ def _triple_lines(topology: "GraphTopology") -> list[str]:
             (t.rel_type, t.count)
         )
 
+    # Build label → display_property lookup for accurate filter examples
+    label_dp: dict[str, str] = {}
+    for li in topology.labels:
+        label_dp[li.label] = li.display_property or "name"
+
     lines: list[str] = ["Relationship topology (use ONLY these types):"]
     for t in sorted_triples:
         bidi = " \u2194 (bidirectional)" if t.bidirectional else ""
         count_note = f" [{t.count:,} relationships]" if t.count > 0 else ""
+        tgt_prop = label_dp.get(t.target_label, "name")
         lines.append(
             f"  ({t.source_label})-[:{t.rel_type}]->({t.target_label}){bidi}{count_note}"
         )
         lines.append(
             f"    filter by {t.target_label}: "
             f"MATCH (a:{t.source_label})-[:{t.rel_type}]->"
-            f"(b:{t.target_label} {{name:'X'}}) RETURN a"
+            f"(b:{t.target_label} {{{tgt_prop}:'X'}}) RETURN a"
         )
         lines.extend(_prefer_hints(t, endpoint_rels))
     return lines
@@ -157,11 +163,20 @@ def _chain_lines(topology: "GraphTopology") -> list[str]:
 
 
 def _prop_lines(topology: "GraphTopology") -> list[str]:
-    """Render the per-label property hints block (empty list if none)."""
+    """Render the per-label property hints block with NL aliases (empty list if none)."""
     entries: list[str] = []
     for li in topology.labels:
         if len(li.properties) > 1:
-            line = f"  {li.label}: {', '.join(li.properties[:8])}"
+            prop_parts = []
+            for prop in li.properties[:8]:
+                nl_terms = li.property_nlp_terms.get(prop, [])
+                if nl_terms:
+                    # Show up to 3 NL aliases inline
+                    aliases = ", ".join(nl_terms[:3])
+                    prop_parts.append(f"{prop} (aka: {aliases})")
+                else:
+                    prop_parts.append(prop)
+            line = f"  {li.label}: {', '.join(prop_parts)}"
             if li.description:
                 line += f"  # {li.description}"
             entries.append(line)
@@ -169,7 +184,7 @@ def _prop_lines(topology: "GraphTopology") -> list[str]:
         return []
     return [
         "",
-        "Node properties (use n.PropertyName in RETURN for property-specific queries):",
+        "Node properties (use n.PropertyName; NL aliases shown in parentheses):",
         *entries,
     ]
 
@@ -208,13 +223,12 @@ def build_topology_section(
 # ── Dynamic prompt builder ────────────────────────────────────────────────────
 
 
-def build_cypher_prompt(topology: "GraphTopology", few_shot: str) -> PromptTemplate:
+def build_cypher_prompt(topology: "GraphTopology", few_shot: str) -> str:
     """
-    Build a ``PromptTemplate`` baked with *topology* and *few_shot* examples.
+    Build a prompt string baked with *topology* and *few_shot* examples.
 
-    ``GraphCypherQAChain`` only interpolates ``{schema}`` and ``{question}``,
-    so the topology section and rules are embedded as literal text in the
-    template string at build time.
+    Returns a plain string (not a PromptTemplate) to avoid issues with
+    literal curly braces in Cypher syntax (e.g., ``{name: 'X'}``).
 
     Parameters
     ----------
@@ -228,8 +242,6 @@ def build_cypher_prompt(topology: "GraphTopology", few_shot: str) -> PromptTempl
     parts: list[str] = [
         "Task: Generate a Cypher statement to query a graph database.",
         "Instructions: Use ONLY the provided relationship types and properties.",
-        "",
-        "Schema:\n{schema}",
     ]
 
     if topology_section:
@@ -244,10 +256,7 @@ def build_cypher_prompt(topology: "GraphTopology", few_shot: str) -> PromptTempl
     if few_shot:
         parts += ["", "Few-shot examples:", few_shot]
 
-    parts += ["", "The question is:\n{question}"]
-
-    template = "\n".join(parts)
-    return PromptTemplate(input_variables=["schema", "question"], template=template)
+    return "\n".join(parts)
 
 
 # ── Fallback static prompt (used before topology is available) ─────────────────

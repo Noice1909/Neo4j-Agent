@@ -54,6 +54,8 @@ class LabelInfo:
     sample_values: dict[str, str] = field(default_factory=dict)
     description: str = ""                          # from Concept.description
     nlp_terms: list[str] = field(default_factory=list)  # from Concept.nlp_terms
+    property_nlp_terms: dict[str, list[str]] = field(default_factory=dict)
+    # property_name -> [nl aliases] from semantic layer (e.g., {"movie_type": ["genre", "type"]})
 
 
 @dataclass

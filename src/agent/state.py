@@ -74,5 +74,9 @@ class PipelineState(TypedDict, total=False):
     # ── Synthesis Agent (10) ───────────────────────────────
     final_answer: str
 
+    # ── Schema Reasoning (semantic layer) ───────────────────
+    property_mappings: list[dict]    # NL term → property annotations
+    schema_context: str              # resolved schema hints for Cypher generation
+
     # ── Error fallback ─────────────────────────────────────
     error_message: str

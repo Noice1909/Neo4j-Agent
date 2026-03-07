@@ -101,11 +101,19 @@ def build_cypher_generation_node(llm: "BaseChatModel"):
                 full_valid_types=valid_rel_types,
             )
 
-            # Add correction guidance if this is a retry
+            # Add schema context from semantic layer (property/relationship mappings)
+            schema_context = state.get("schema_context", "")
+
+            # Build final prompt text
+            prompt_text = cypher_prompt
+
             if retry_count > 0 and correction_guidance:
-                prompt_text = f"{cypher_prompt}\n\n{correction_guidance}\n\nQuestion: {question}\nCypher:"
-            else:
-                prompt_text = f"{cypher_prompt}\n\nQuestion: {question}\nCypher:"
+                prompt_text += f"\n\n{correction_guidance}"
+
+            if schema_context:
+                prompt_text += f"\n\n{schema_context}"
+
+            prompt_text += f"\n\nQuestion: {question}\nCypher:"
 
             # Invoke LLM to generate Cypher
             loop = asyncio.get_running_loop()
@@ -128,7 +136,7 @@ def build_cypher_generation_node(llm: "BaseChatModel"):
             logger.info(
                 "Cypher generated (attempt %d): %s",
                 retry_count,
-                generated_cypher[:200],
+                generated_cypher,
             )
 
             return {

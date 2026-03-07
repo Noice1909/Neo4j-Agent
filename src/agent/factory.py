@@ -33,6 +33,7 @@ def init_agent(
     topology,
     graph,
     settings,
+    semantic_layer=None,
 ) -> None:
     """
     Build and cache the compiled multi-agent supervisor system.
@@ -54,6 +55,8 @@ def init_agent(
         Neo4j graph connection (Neo4jGraph).
     settings:
         Application settings (Settings).
+    semantic_layer:
+        Optional SchemaSemanticLayer for NL-aware property/relationship mapping.
     """
     global _compiled_agent
     logger.info("Building multi-agent supervisor system...")
@@ -64,6 +67,7 @@ def init_agent(
         topology=topology,
         graph=graph,
         settings=settings,
+        semantic_layer=semantic_layer,
     )
     logger.info("Multi-agent system ready (1 supervisor + 9 pipeline agents).")
 
