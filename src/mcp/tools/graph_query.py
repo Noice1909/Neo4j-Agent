@@ -1,45 +1,21 @@
 """
-Graph query tool — thin wrappers for LangChain agent and FastMCP.
+Graph query tool — MCP integration for multi-agent system.
 
-The core business logic lives in ``src.services.graph_query.run_graph_query()``.
+Since the old tool-based approach has been replaced with the multi-agent supervisor,
+this module now provides a simplified MCP interface that invokes the supervisor directly.
 """
 from __future__ import annotations
 
-from langchain.tools import tool
-from langchain_core.language_models import BaseChatModel
-
-from src.graph.schema_cache import SchemaCache
-from src.services.graph_query import run_graph_query
+from langchain_core.messages import HumanMessage
 
 
-def build_graph_query_tool(llm: BaseChatModel, schema_cache: SchemaCache):
-    """Create the LangChain @tool with bound dependencies and return it."""
+def register_mcp_tool(mcp) -> None:
+    """
+    Register the graph-query tool on a FastMCP server instance.
 
-    @tool
-    async def query_graph_tool(question: str) -> str:
-        """
-        Query the Neo4j knowledge graph using natural language.
-
-        Use this tool to answer questions about data stored in the graph database.
-        Translate the natural language question into Cypher, execute it against
-        Neo4j (read-only), and return a human-readable answer.
-
-        If the question uses pronouns or references previous results, use
-        conversation context to resolve them before querying.
-
-        Args:
-            question: A natural-language question about the graph data.
-        """
-        return await run_graph_query(question, llm, schema_cache)
-
-    return query_graph_tool
-
-
-query_graph_tool = None
-
-
-def register_mcp_tool(mcp, llm: BaseChatModel, schema_cache: SchemaCache) -> None:
-    """Register the graph-query tool on a ``FastMCP`` server instance."""
+    Note: No longer needs llm or schema_cache — the supervisor agent has them.
+    """
+    from src.core.dependencies import get_agent
 
     @mcp.tool(
         name="query_graph",
@@ -51,6 +27,24 @@ def register_mcp_tool(mcp, llm: BaseChatModel, schema_cache: SchemaCache) -> Non
         ),
     )
     async def _mcp_query_graph(question: str) -> str:
-        return await run_graph_query(question, llm, schema_cache)
+        """
+        MCP tool: invokes the supervisor agent with a stateless query.
+
+        Since MCP has no session_id, we use a fresh state for each query.
+        No conversation history is maintained across MCP calls.
+        """
+        agent = get_agent()
+
+        # Build minimal state for supervisor
+        state = {
+            "messages": [HumanMessage(content=question)],
+        }
+
+        # Invoke supervisor (no session persistence for MCP)
+        result = await agent.ainvoke(state)
+
+        # Extract final answer from AIMessage
+        final_message = result.get("messages", [])[-1]
+        return str(final_message.content)
 
     _ = _mcp_query_graph  # registered by @mcp.tool decorator

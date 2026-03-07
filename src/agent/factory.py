@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from src.agent.graph import build_agent_graph  # noqa: E402
+from src.agent.supervisor import build_supervisor_graph  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -28,48 +28,44 @@ _compiled_agent: "CompiledGraph | None" = None
 
 def init_agent(
     llm: BaseChatModel,
-    tools: list,
     checkpointer: BaseCheckpointSaver,
-    *,
-    schema_labels: list[str] | None = None,
-    label_descriptions: dict[str, str] | None = None,
-    max_conversation_tokens: int = 100_000,
-    token_budget_reserve: int = 4096,
+    schema_cache,
+    topology,
+    graph,
+    settings,
 ) -> None:
     """
-    Build and cache the compiled LangGraph agent.
+    Build and cache the compiled multi-agent supervisor system.
 
-    Must be called once in the application lifespan startup after both the
-    LLM and checkpointer are initialised.
+    Must be called once in the application lifespan startup after all
+    dependencies are initialized.
 
     Parameters
     ----------
     llm:
         A configured `BaseChatModel` instance.
-    tools:
-        List of LangChain `BaseTool` instances to bind to the agent.
     checkpointer:
-        An initialised `BaseCheckpointSaver` (e.g. `AsyncRedisSaver`).
-    schema_labels:
-        Canonical Neo4j node labels from the live schema (used to build the
-        domain-aware system prompt).
-    max_conversation_tokens:
-        Maximum token budget for conversation history.
-    token_budget_reserve:
-        Tokens reserved for model output.
+        An initialized `BaseCheckpointSaver` (e.g. `AsyncRedisSaver`).
+    schema_cache:
+        Schema cache instance (SchemaCache).
+    topology:
+        Graph topology (GraphTopology).
+    graph:
+        Neo4j graph connection (Neo4jGraph).
+    settings:
+        Application settings (Settings).
     """
     global _compiled_agent
-    logger.info("Building LangGraph agent with %d tool(s)...", len(tools))
-    _compiled_agent = build_agent_graph(
-        llm,
-        tools,
-        checkpointer,
-        schema_labels=schema_labels,
-        label_descriptions=label_descriptions,
-        max_conversation_tokens=max_conversation_tokens,
-        token_budget_reserve=token_budget_reserve,
+    logger.info("Building multi-agent supervisor system...")
+    _compiled_agent = build_supervisor_graph(
+        llm=llm,
+        checkpointer=checkpointer,
+        schema_cache=schema_cache,
+        topology=topology,
+        graph=graph,
+        settings=settings,
     )
-    logger.info("LangGraph agent ready.")
+    logger.info("Multi-agent system ready (1 supervisor + 9 pipeline agents).")
 
 
 def get_compiled_agent() -> "CompiledGraph":

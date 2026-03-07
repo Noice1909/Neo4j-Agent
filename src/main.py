@@ -67,12 +67,9 @@ from src.graph.cypher.coreference import build_coreference_regex, set_coreferenc
 from src.graph.schema_cache import SchemaCache
 from src.llm.factory import get_llm_from_settings
 from src.mcp.server import mcp, register_all_tools
-from src.mcp.tools.graph_query import build_graph_query_tool
-from src.mcp.tools.schema_info import build_schema_info_tool
-from src.mcp.tools.vector_search import build_vector_search_tool
 from src.middleware.auth import APIKeyMiddleware
 from src.middleware.rate_limit import limiter
-from src.services.query_dedup import QueryDeduplicator
+from src.core.query_dedup import QueryDeduplicator
 
 try:
     from prometheus_fastapi_instrumentator import Instrumentator
@@ -205,29 +202,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         set_query_dedup_instance(query_dedup)
         logger.info("Query deduplication DISABLED.")
 
-    # ── 5. Build LangChain tools ──────────────────────────────────────────────
-    logger.info("[5/8] Building LangChain tools...")
+    # ── 5. Initialize LLM ─────────────────────────────────────────────────────
+    logger.info("[5/8] Initializing LLM...")
     llm = get_llm_from_settings(settings)
-    tools = [
-        build_graph_query_tool(llm, schema_cache),
-        build_schema_info_tool(schema_cache),
-        build_vector_search_tool(llm),
-    ]
 
     # ── 5b. Concept-based synonym enrichment (no LLM call needed) ───────────
     logger.info("[5b] Synonym enrichment via Concept nodes: %d labels covered.", len(topology.nlp_terms_by_label))
 
-    # ── 6. Compile LangGraph agent ────────────────────────────────────────────
-    logger.info("[6/8] Compiling LangGraph agent...")
+    # ── 6. Compile multi-agent supervisor system ─────────────────────────────
+    logger.info("[6/8] Compiling multi-agent supervisor system...")
     from src.agent.checkpointer import get_checkpointer
     init_agent(
         llm=llm,
-        tools=tools,
         checkpointer=get_checkpointer(),
-        schema_labels=topology.label_names,
-        label_descriptions={li.label: li.description for li in topology.labels if li.description},
-        max_conversation_tokens=settings.max_conversation_tokens,
-        token_budget_reserve=settings.token_budget_reserve,
+        schema_cache=schema_cache,
+        topology=topology,
+        graph=graph,
+        settings=settings,
     )
 
     # ── 7. Register FastMCP tools ─────────────────────────────────────────────

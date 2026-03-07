@@ -27,7 +27,6 @@ from src.core.tracing import SessionTracer, set_tracer, trace_event
 from src.middleware.rate_limit import limiter
 from src.core.config import get_settings
 from src.api.schemas.chat import ChatRequest, ChatResponse
-from src.services.query_dedup import QueryDeduplicator
 
 logger = logging.getLogger(__name__)
 

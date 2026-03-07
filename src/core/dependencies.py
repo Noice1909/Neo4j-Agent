@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph as CompiledGraph
 
     from src.graph.schema_cache import SchemaCache
-    from src.services.query_dedup import QueryDeduplicator
+    from src.core.query_dedup import QueryDeduplicator
 
 # Module-level schema_cache reference — set during lifespan startup.
 _schema_cache_instance: "SchemaCache | None" = None

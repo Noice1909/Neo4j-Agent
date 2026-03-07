@@ -60,7 +60,7 @@ def register_all_tools(settings: Settings) -> None:
     llm = get_llm_from_settings(settings)
     schema_cache = get_schema_cache_instance()
 
-    gq_module.register_mcp_tool(mcp, llm, schema_cache)
+    gq_module.register_mcp_tool(mcp)
     si_module.register_mcp_tool(mcp, schema_cache)
     vs_module.register_mcp_tool(mcp, llm)
 
